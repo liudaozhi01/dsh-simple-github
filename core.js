@@ -548,7 +548,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         for (const [key,value] of clones) { if (clones.size <= 20) break; if (value.state !== 'running') clones.delete(key); }
         void (async()=>{
           try {
-            await gh(['repo','clone',`https://github.com/${repository}.git`,directory,'--','--progress','-c','credential.helper=','-c',`credential.helper=${await credentialHelper()}`], {
+            await gh(['repo','clone',`https://github.com/${repository}.git`,directory,'--','--branch','dev','--single-branch','--progress','-c','credential.helper=','-c',`credential.helper=${await credentialHelper()}`], {
               cwd:parentDirectory, timeout:600000, signal:controller.signal, truncate:true,
               onOutput(chunk) {
                 item.log = redact(item.log + chunk.replace(/\x1b\[[0-9;]*m/g,'')).slice(-12000);

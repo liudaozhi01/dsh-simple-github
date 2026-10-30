@@ -29,7 +29,7 @@ export function mount(root,options={}){
  function external(label,url){const n=el('a',label);try{const u=new URL(url);if(u.protocol==='https:'&&u.hostname==='github.com'){n.href=u.href;n.target='_blank';n.rel='noopener noreferrer';}}catch{}return n;}
  async function run(action){if(state.busy||state.clone?.state==='running'||disposed)return;state.busy=true;render();try{await action();}catch(e){message(e.message,true);}finally{state.busy=false;if(!disposed)render();}}
  let update=null,updatePhase='',updateResult=null;
-  options.autoInstaller?.reconcile().then(record=>{if(record&&!disposed){updateResult={text:record.message,failed:record.state==='unknown'};render();}}).catch(()=>{});
+  const reconciliation=options.autoInstaller?.reconcile().then(record=>{if(record&&!disposed){updateResult={text:record.message,failed:record.state==='unknown'};render();}}).catch(()=>{});
   async function checkUpdate(){
    update=null;updateResult=null;updatePhase='checking';render();
    try{const result=await api('/update-check',{});if(disposed)return;update=result;updateResult={text:result.available?'发现可用更新，请先阅读版本更新说明。':'检查完成，当前没有可用更新。',failed:false};}
@@ -55,7 +55,7 @@ export function mount(root,options={}){
   }
   function renderUpdate(){
    const box=section('插件远程更新');
-   box.append(el('p','仅点击检查时访问远程更新源。确认更新后自动下载安装，可能重载面板；需要重启时会提示，不自动重启 DSH。','sg-muted'));
+   box.append(el('p','打开面板时自动检查一次新版本，也可手动重新检查。仅在确认更新后下载安装，可能重载面板；需要重启时会提示，不自动重启 DSH。','sg-muted'));
    box.append(row(button(updatePhase==='checking'?'正在检查更新…':'检查插件更新',checkUpdate),...((update?.available&&update.checkId)?[button(updatePhase==='installing'?'正在下载校验…':'更新插件（自动安装）',installUpdate)]:[])));
    if(update){box.append(el('p','当前版本：'+update.currentVersion+' · 远程版本：'+update.version));box.append(el('p','版本更新说明'),el('pre',update.notes||'暂无更新说明。'));}
    if(updatePhase)loading(box,updatePhase==='checking'?'正在检查远程更新，请稍候…':'正在下载并校验更新包，请等待完成…');
@@ -112,7 +112,7 @@ export function mount(root,options={}){
    project.append(row(dir,button('选择目录',()=>pickDirectory(dir,true),true)));
   const details=disclosure('clone-form');details.append(el('summary','还没有项目？克隆 GitHub 仓库'));
   const parent=input('保存到哪个已有文件夹（绝对路径），例如 '+(isWindows?'C:\\Users\\你的名字\\Projects':isMac?'/Users/你的名字/Projects':'/home/你的名字/Projects'),undefined,'clone-parent');
-  details.append(el('p','团队项目已预设，只需选择保存位置；会在该位置新建项目文件夹。','sg-muted'),row(parent,button('选择目录',()=>pickDirectory(parent))),button('克隆并打开',async()=>{if(!confirm('将团队项目克隆到 '+parent.value+' 下？'))return;const result=await api('/clone',{parentDirectory:parent.value.trim()});state.clone={...result,phase:'正在连接 GitHub…',percent:null,log:''};message('正在克隆，请勿关闭应用。');void pollClone(result.id);},true));project.append(details);
+  details.append(el('p','团队项目已预设，只克隆 dev 分支并直接打开；请选择保存位置，会在该位置新建项目文件夹。','sg-muted'),row(parent,button('选择目录',()=>pickDirectory(parent))),button('克隆并打开',async()=>{if(!confirm('将团队项目克隆到 '+parent.value+' 下？'))return;const result=await api('/clone',{parentDirectory:parent.value.trim()});state.clone={...result,phase:'正在连接 GitHub…',percent:null,log:''};message('正在克隆，请勿关闭应用。');void pollClone(result.id);},true));project.append(details);
   if(state.clone){const c=state.clone,done=c.state==='success';const progressBox=el('section');progressBox.setAttribute('aria-live','polite');progressBox.append(el('h3',c.state==='running'?'正在克隆…':done?'✓ 克隆完成':'克隆失败'));
     if(done)progressBox.append(el('p','仓库已下载完成。保存位置：'+c.directory));else progressBox.append(el('p',displayText(c.phase||'正在连接 GitHub…')));
     if(!done){const bar=el('progress');bar.max=100;bar.style.width='100%';if(c.percent!==null&&c.percent!==undefined)bar.value=c.percent;
@@ -180,6 +180,6 @@ function renderCode(repo){
  push.append(el('p','DSH 修改的文件已在本机，无需额外点击保存。自测完成后，使用“提交并推送到 dev”分享给团队。不强推；冲突请让 DSH 协助处理。test / 生产发布仍由负责人操作。','sg-muted'));
 }
 state.directory=savedProject();
- render();void run(async()=>{await refreshStatus();if(disposed||!state.directory)return;try{await inspect();if(!disposed)message('已恢复上次选择的项目。');}catch(error){if(!disposed)message('无法恢复上次项目，已保留路径，请检查目录或重新选择：'+error.message,true);}});
+ render();void run(async()=>{await refreshStatus();await reconciliation;if(disposed)return;if(!updateResult)await checkUpdate();if(disposed||!state.directory)return;try{await inspect();if(!disposed)message('已恢复上次选择的项目。');}catch(error){if(!disposed)message('无法恢复上次项目，已保留路径，请检查目录或重新选择：'+error.message,true);}});
  return()=>{closePendingTestPage();disposed=true;++loginGeneration;clearTimeout(timer);clearTimeout(cloneTimer);clearTimeout(deployTimer);root.replaceChildren();};
 }

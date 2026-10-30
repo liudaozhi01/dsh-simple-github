@@ -28,6 +28,7 @@ test('clone defaults to the fixed repository when repository is omitted',async()
   assert.equal((await service.route('clone-status',{id:job.id})).state,'success');
   assert.equal(calls.length,1); assert.equal(calls[0].cmd,'mock-gh');
   assert.deepEqual(calls[0].args.slice(0,4),['repo','clone',`https://github.com/${FIXED_REPOSITORY}.git`,join(await realpath(parent),'XiAN-OA')]);
+   assert.deepEqual(calls[0].args.slice(4,8),['--','--branch','dev','--single-branch']);
  } finally { service.close(); }
 });
 test('clone rejects other repositories before starting any command',async()=>{
