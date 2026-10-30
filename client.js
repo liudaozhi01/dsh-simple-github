@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
     const ref=React.useRef(null);
     React.useEffect(()=>{
      let cancelled=false,dispose;
-     import('/simple-github/panel.js?v=0.1.0').then(module=>{
+     import('/simple-github/panel.js?v=0.2.0').then(module=>{
       if(!cancelled&&ref.current)dispose=module.mount(ref.current,{getSessionId:()=>{const active=ctx.sidebarRight.mounted.getSnapshot();return sessionId&&active===sessionId?sessionId:null;}});
      }).catch(error=>{if(!cancelled&&ref.current)ref.current.textContent='GitHub 面板加载失败：'+error.message;});
      return()=>{cancelled=true;dispose?.();};

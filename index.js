@@ -2,9 +2,12 @@ import { readFile } from 'node:fs/promises';
 import { API_BASE, ApiError, checkRequest, createService, readJson, redact, chooseDirectory } from './core.js';
 
 import { createConflictNotifier } from './conflict-notice.js';
+import { createRemoteUpdater } from './remote-update.js';
 export const inject = ['webServer'];
 export function apply(ctx) {
   const service = createService();
+  const updater = createRemoteUpdater();
+  ctx.effect(() => () => updater.close());
   const notifier = createConflictNotifier(ctx, service);
   ctx.effect(() => () => service.close());
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/simple-github', async handler(req, res) {
@@ -24,12 +27,12 @@ export function apply(ctx) {
       if (!url.pathname.startsWith(`${API_BASE}/`)) throw new ApiError('Not found', 404);
       const name = url.pathname.slice(API_BASE.length + 1);
       const get = name === 'status' || (name === 'login' && url.searchParams.has('id'));
-      const routes = ['choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
+      const routes = ['update-check','update-install','choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
       if (!routes.includes(name)) throw new ApiError('Not found', 404);
       if (req.method !== (get ? 'GET' : 'POST')) throw new ApiError(get ? 'GET required' : 'POST required', 405);
       let body = {};
       if (!get) { if (!service.tokenMatches(req.headers['x-simple-git-token'])) throw new ApiError('Missing or invalid CSRF token; refresh status', 403); body = await readJson(req); }
-      reply(200, name === 'choose-directory' ? await chooseDirectory() : name === 'notify-conflict' ? await notifier.notify(body) : await service.route(name, body, url.searchParams));
+      reply(200, name === 'update-check' ? await updater.check() : name === 'update-install' ? await updater.install(body) : name === 'choose-directory' ? await chooseDirectory() : name === 'notify-conflict' ? await notifier.notify(body) : await service.route(name, body, url.searchParams));
     } catch (error) { reply(error instanceof ApiError ? error.status : [400,409,503,504].includes(error.status) ? error.status : 400, { ok: false, error: error instanceof ApiError ? error.message : redact(error.message || 'Operation failed').slice(0, 1000) }); }
   } }));
 }

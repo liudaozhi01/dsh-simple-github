@@ -1,7 +1,7 @@
 const BASE='/simple-github/api';
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
 export function mount(root,options={}){
- const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.1.0';
+ const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.2.0';
  const app=el('main',undefined,'sg-app');root.replaceChildren(link,app);
  let deploy=null,deployTimer,testWindow=null,awaitingTestPage=false;
   function closePendingTestPage(){try{testWindow?.close();}catch{}testWindow=null;awaitingTestPage=false;}
@@ -28,7 +28,33 @@ export function mount(root,options={}){
  function row(...nodes){const n=el('div',undefined,'sg-row');n.append(...nodes);return n;}
  function external(label,url){const n=el('a',label);try{const u=new URL(url);if(u.protocol==='https:'&&u.hostname==='github.com'){n.href=u.href;n.target='_blank';n.rel='noopener noreferrer';}}catch{}return n;}
  async function run(action){if(state.busy||state.clone?.state==='running'||disposed)return;state.busy=true;render();try{await action();}catch(e){message(e.message,true);}finally{state.busy=false;if(!disposed)render();}}
- let noticeStatus='';
+ let update=null,updatePhase='',updateResult=null;
+  async function checkUpdate(){
+   update=null;updateResult=null;updatePhase='checking';render();
+   try{const result=await api('/update-check',{});if(disposed)return;update=result;updateResult={text:result.available?'发现可用更新，请先阅读版本更新说明。':'检查完成，当前没有可用更新。',failed:false};}
+   catch(error){update=null;updateResult={text:'更新检查失败：'+error.message,failed:true};}
+   finally{updatePhase='';}
+  }
+  async function installUpdate(){
+   const candidate=update;if(!candidate?.available||!candidate.checkId)return;
+   if(!confirm('确认下载 '+candidate.version+'？仅使用你信任的更新包；本步骤只下载校验，不安装。后续请等待所有 Agent 任务结束，再通过 DSH 插件管理安装，可能需要重启 DSH，本插件不会自动重启。')){updateResult={text:'已取消安装更新，未发起安装请求。',failed:false};return;}
+   updatePhase='installing';updateResult=null;render();
+   try{const result=await api('/update-install',{checkId:candidate.checkId,confirmed:true});if(disposed)return;
+    update=null;
+    const manual=Boolean(result.manualInstallPath),failed=!manual&&result.installed===false;
+    updateResult={text:(manual?'更新包已准备，尚未自动安装。':failed?'更新未安装完成：':'更新操作成功：')+(result.message||'请求已完成。')+(result.restartRequired?' 需要你手动重启 DSH。':'')+' 不会自动重启 DSH。',failed,manualInstallPath:result.manualInstallPath};
+   }catch(error){update=null;updateResult={text:'更新安装失败或未确认完成：'+error.message+'。请重新检查更新后再试，不会自动重启 DSH。',failed:true};}
+   finally{updatePhase='';}
+  }
+  function renderUpdate(){
+   const box=section('插件远程更新');
+   box.append(el('p','仅点击检查时访问远程更新源，不会自动检查、安装或重启 DSH。','sg-muted'));
+   box.append(row(button(updatePhase==='checking'?'正在检查更新…':'检查插件更新',checkUpdate),...((update?.available&&update.checkId)?[button(updatePhase==='installing'?'正在下载校验…':'下载并校验更新包',installUpdate)]:[])));
+   if(update){box.append(el('p','当前版本：'+update.currentVersion+' · 远程版本：'+update.version));box.append(el('p','版本更新说明'),el('pre',update.notes||'暂无更新说明。'));}
+   if(updatePhase)loading(box,updatePhase==='checking'?'正在检查远程更新，请稍候…':'正在下载并校验更新包，请等待完成…');
+   if(updateResult){box.append(el('p',updateResult.text,updateResult.failed?'sg-error':'sg-success'));if(updateResult.manualInstallPath)box.append(el('p','请通过 DSH 管理手动安装此绝对路径的更新包：'+updateResult.manualInstallPath));}
+  }
+  let noticeStatus='';
  const notified=new Set();
   const unmerged=change=>['DD','AU','UD','UA','DU','AA','UU'].includes(change.status.trim());
  const conflicted=repo=>repo?.changes?.some(c=>['DD','AU','UD','UA','DU','AA','UU'].includes(c.status.trim()));
@@ -89,7 +115,8 @@ export function mount(root,options={}){
    const repo=state.repo;project.append(el('p','团队项目 · 当前分支：'+repo.branch,'sg-muted'));
     renderCode(repo);
   }
-  app.setAttribute('aria-busy',String(state.busy));if(focusKey&&!state.busy){const target=[...(app.querySelectorAll?.('input,textarea')||[])].find(n=>n.sgDraftKey===focusKey);target?.focus();if(selection)target?.setSelectionRange(...selection);}
+  renderUpdate();
+   app.setAttribute('aria-busy',String(state.busy));if(focusKey&&!state.busy){const target=[...(app.querySelectorAll?.('input,textarea')||[])].find(n=>n.sgDraftKey===focusKey);target?.focus();if(selection)target?.setSelectionRange(...selection);}
  }
  async function refreshDeploy(){const directory=state.directory;const result=await api('/deploy-status',{directory});if(disposed||directory!==state.directory)return;const previous=deploy;deploy=result;
    const ready=result.state==='running'&&result.frontend?.ready&&result.backend?.ready;
