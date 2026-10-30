@@ -1,10 +1,10 @@
 {
   "name": "@local/dsh-simple-github",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "description": "简洁 GitHub 团队协作：网页登录、提交推送、PR 合并",
   "type": "module",
   "exports": {".": "./index.js", "./client": "./client.js"},
-  "files": ["remote-update.js", "index.js", "core.js", "platform.js", "windows-tools.js", "local-deploy.js", "conflict-notice.js", "client.js", "panel.js", "panel.css", "cordis.patch.yml", "README.md"],
+  "files": ["auto-install.js", "remote-update.js", "index.js", "core.js", "platform.js", "windows-tools.js", "local-deploy.js", "conflict-notice.js", "client.js", "panel.js", "panel.css", "cordis.patch.yml", "README.md"],
   "scripts": {"test": "node test-runner.mjs"},
   "dsh": {"bundle": {"patch": "./cordis.patch.yml"}, "client": {"platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right"]}},
   "license": "MIT"

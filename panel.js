@@ -1,7 +1,7 @@
 const BASE='/simple-github/api';
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
 export function mount(root,options={}){
- const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.2.0';
+ const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.4.0';
  const app=el('main',undefined,'sg-app');root.replaceChildren(link,app);
  let deploy=null,deployTimer,testWindow=null,awaitingTestPage=false;
   function closePendingTestPage(){try{testWindow?.close();}catch{}testWindow=null;awaitingTestPage=false;}
@@ -29,6 +29,7 @@ export function mount(root,options={}){
  function external(label,url){const n=el('a',label);try{const u=new URL(url);if(u.protocol==='https:'&&u.hostname==='github.com'){n.href=u.href;n.target='_blank';n.rel='noopener noreferrer';}}catch{}return n;}
  async function run(action){if(state.busy||state.clone?.state==='running'||disposed)return;state.busy=true;render();try{await action();}catch(e){message(e.message,true);}finally{state.busy=false;if(!disposed)render();}}
  let update=null,updatePhase='',updateResult=null;
+  options.autoInstaller?.reconcile().then(record=>{if(record&&!disposed){updateResult={text:record.message,failed:record.state==='unknown'};render();}}).catch(()=>{});
   async function checkUpdate(){
    update=null;updateResult=null;updatePhase='checking';render();
    try{const result=await api('/update-check',{});if(disposed)return;update=result;updateResult={text:result.available?'发现可用更新，请先阅读版本更新说明。':'检查完成，当前没有可用更新。',failed:false};}
@@ -37,19 +38,25 @@ export function mount(root,options={}){
   }
   async function installUpdate(){
    const candidate=update;if(!candidate?.available||!candidate.checkId)return;
-   if(!confirm('确认下载 '+candidate.version+'？仅使用你信任的更新包；本步骤只下载校验，不安装。后续请等待所有 Agent 任务结束，再通过 DSH 插件管理安装，可能需要重启 DSH，本插件不会自动重启。')){updateResult={text:'已取消安装更新，未发起安装请求。',failed:false};return;}
+   if(deploy&&['running','starting','checking'].includes(deploy.state))throw new Error('请先停止本地部署再安装更新');
+   if(!confirm('确认更新到 '+candidate.version+'？将下载、校验并自动安装你信任的更新包。请确认所有 Agent 任务结束、本地部署已停止且没有其他插件操作。更新可能重载面板，或需要手动重启 DSH；不会自动重启。')){updateResult={text:'已取消安装更新，未发起安装请求。',failed:false};return;}
    updatePhase='installing';updateResult=null;render();
    try{const result=await api('/update-install',{checkId:candidate.checkId,confirmed:true});if(disposed)return;
     update=null;
+    if(result.manualInstallPath&&options.autoInstaller){
+     if(deploy&&['running','starting','checking'].includes(deploy.state))throw new Error('请先停止本地部署再安装更新');
+     const installed=await options.autoInstaller.install({manualInstallPath:result.manualInstallPath,version:candidate.version});
+     updateResult={text:installed.message,failed:false};return;
+    }
     const manual=Boolean(result.manualInstallPath),failed=!manual&&result.installed===false;
     updateResult={text:(manual?'更新包已准备，尚未自动安装。':failed?'更新未安装完成：':'更新操作成功：')+(result.message||'请求已完成。')+(result.restartRequired?' 需要你手动重启 DSH。':'')+' 不会自动重启 DSH。',failed,manualInstallPath:result.manualInstallPath};
-   }catch(error){update=null;updateResult={text:'更新安装失败或未确认完成：'+error.message+'。请重新检查更新后再试，不会自动重启 DSH。',failed:true};}
+   }catch(error){update=null;updateResult={text:'更新安装失败或未确认完成：'+error.message+'。若已提交安装，请先在插件管理核对结果，勿重复安装；不会自动重启 DSH。',failed:true};}
    finally{updatePhase='';}
   }
   function renderUpdate(){
    const box=section('插件远程更新');
-   box.append(el('p','仅点击检查时访问远程更新源，不会自动检查、安装或重启 DSH。','sg-muted'));
-   box.append(row(button(updatePhase==='checking'?'正在检查更新…':'检查插件更新',checkUpdate),...((update?.available&&update.checkId)?[button(updatePhase==='installing'?'正在下载校验…':'下载并校验更新包',installUpdate)]:[])));
+   box.append(el('p','仅点击检查时访问远程更新源。确认更新后自动下载安装，可能重载面板；需要重启时会提示，不自动重启 DSH。','sg-muted'));
+   box.append(row(button(updatePhase==='checking'?'正在检查更新…':'检查插件更新',checkUpdate),...((update?.available&&update.checkId)?[button(updatePhase==='installing'?'正在下载校验…':'更新插件（自动安装）',installUpdate)]:[])));
    if(update){box.append(el('p','当前版本：'+update.currentVersion+' · 远程版本：'+update.version));box.append(el('p','版本更新说明'),el('pre',update.notes||'暂无更新说明。'));}
    if(updatePhase)loading(box,updatePhase==='checking'?'正在检查远程更新，请稍候…':'正在下载并校验更新包，请等待完成…');
    if(updateResult){box.append(el('p',updateResult.text,updateResult.failed?'sg-error':'sg-success'));if(updateResult.manualInstallPath)box.append(el('p','请通过 DSH 管理手动安装此绝对路径的更新包：'+updateResult.manualInstallPath));}

@@ -5,7 +5,15 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createRemoteUpdater, newerVersion, releaseCandidate, UPDATE_REPOSITORY } from './remote-update.js';
-const bytes = Buffer.from('fixture package');
+import { gzipSync } from 'node:zlib';
+import { validateUpdatePackage } from './remote-update.js';
+function packageBytes(name='@local/dsh-simple-github',version='0.3.0'){
+ const content=Buffer.from(JSON.stringify({name,version})),header=Buffer.alloc(512);
+ header.write('package/package.json');header.write(content.length.toString(8),124);header[156]=48;
+ return gzipSync(Buffer.concat([header,content,Buffer.alloc((512-content.length%512)%512),Buffer.alloc(1024)]));
+}
+const bytes = packageBytes();
+test('package identity validated before install',()=>{validateUpdatePackage(bytes,'0.3.0');assert.throws(()=>validateUpdatePackage(packageBytes('other'),'0.3.0'));assert.throws(()=>validateUpdatePackage(bytes,'0.4.0'));assert.throws(()=>validateUpdatePackage(Buffer.from('bad'),'0.3.0'));});
 const release = () => ({draft:false, prerelease:false, tag_name:'v0.3.0', body:'<img onerror=alert(1)>', assets:[{name:'local-dsh-simple-github-0.3.0.tgz', id:123, size:bytes.length, digest:'sha256:' + createHash('sha256').update(bytes).digest('hex')}]});
 test('strict stable versions compare numerically and reject malformed metadata', () => {
   assert.equal(newerVersion('0.10.0','0.2.0'),true);

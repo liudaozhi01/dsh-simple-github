@@ -4,6 +4,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ApiError, findGh, runCommand } from './core.js';
 import { normalizeEnv } from './platform.js';
+import { gunzipSync } from 'node:zlib';
+
+export function validateUpdatePackage(bytes, version) {
+  let tar;
+  try { tar = gunzipSync(bytes, {maxOutputLength:32*1024*1024}); } catch { throw new ApiError('更新包不是有效 tgz'); }
+  const manifests=[];
+  for(let offset=0;offset+512<=tar.length;){
+    const header=tar.subarray(offset,offset+512);
+    if(header.every(byte=>byte===0))break;
+    const name=header.subarray(0,100).toString().replace(/\0.*$/s,'');
+    const raw=header.subarray(124,136).toString().replace(/\0.*$/s,'').trim();
+    if(!/^[0-7]+$/.test(raw))throw new ApiError('更新包 tar 大小无效');
+    const size=parseInt(raw,8),start=offset+512;
+    if(start+size>tar.length)throw new ApiError('更新包 tar 不完整');
+    if(name==='package/package.json'){
+      if(![0,48].includes(header[156])||size>65536)throw new ApiError('更新包 manifest 无效');
+      try { manifests.push(JSON.parse(tar.subarray(start,start+size).toString('utf8'))); } catch { throw new ApiError('更新包 manifest 无效'); }
+    }
+    offset=start+Math.ceil(size/512)*512;
+  }
+  if(manifests.length!==1||manifests[0].name!=='@local/dsh-simple-github'||manifests[0].version!==version)throw new ApiError('更新包插件名称或版本不匹配，拒绝安装');
+}
 
 export const UPDATE_REPOSITORY = 'liudaozhi01/dsh-simple-github';
 const MAX_PACKAGE = 16 * 1024 * 1024;
@@ -72,6 +94,7 @@ export function createRemoteUpdater({ command = runCommand, locateGh = findGh, n
       if (['version','assetId','size','digest','name'].some(key => fresh[key] !== expected[key])) { candidate = null; throw new ApiError('远程版本或安装包已变化，请重新检查更新', 409); }
       const bytes = await ghApi(`repos/${UPDATE_REPOSITORY}/releases/assets/${expected.assetId}`, true);
       if (!Buffer.isBuffer(bytes) || bytes.length !== expected.size || 'sha256:' + createHash('sha256').update(bytes).digest('hex') !== expected.digest) throw new ApiError('安装包 SHA-256 或大小校验失败，未安装');
+      validateUpdatePackage(bytes, expected.version);
       if (closed) throw new ApiError('更新服务已关闭', 409);
       const directory = await mkdtemp(join(tempDirectory, 'dsh-simple-github-update-'));
       const path = join(directory, expected.name);

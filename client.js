@@ -2,15 +2,16 @@ window.__ModuleLoader__.load({
  id:'@local/dsh-simple-github',
  factory:require=>{
   const React=require('react');
-  const inject=['slots','sidebarRight','sidebarRightTabs'];
+  const inject=['slots','sidebarRight','sidebarRightTabs','remote','remote.pluginManager'];
   function apply(ctx){
    const id='@local/dsh-simple-github/panel',kind='simple-github';
    function Panel({sessionId}={}){
     const ref=React.useRef(null);
     React.useEffect(()=>{
      let cancelled=false,dispose;
-     import('/simple-github/panel.js?v=0.2.0').then(module=>{
-      if(!cancelled&&ref.current)dispose=module.mount(ref.current,{getSessionId:()=>{const active=ctx.sidebarRight.mounted.getSnapshot();return sessionId&&active===sessionId?sessionId:null;}});
+     Promise.all([import('/simple-github/panel.js?v=0.4.0'),import('/simple-github/auto-install.js?v=0.4.0')]).then(([module,installer])=>{
+      const autoInstaller=installer.createAutoInstaller(ctx.remote.pluginManager);
+      if(!cancelled&&ref.current)dispose=module.mount(ref.current,{autoInstaller,getSessionId:()=>{const active=ctx.sidebarRight.mounted.getSnapshot();return sessionId&&active===sessionId?sessionId:null;}});
      }).catch(error=>{if(!cancelled&&ref.current)ref.current.textContent='GitHub 面板加载失败：'+error.message;});
      return()=>{cancelled=true;dispose?.();};
     },[sessionId]);

@@ -81,6 +81,35 @@ test('fixed commands, env sanitation, confirmation, verification and asynchronou
   assert.ok(deploy.kills.some(([pid, signal]) => pid < 0 && signal === 'SIGKILL'));
 });
 
+test('fixed local MySQL is backend-only and password is redacted even across chunks', async t => {
+  const deploy = await fixture(t, { deps: { env: {
+    PATH: '/bin', XINGLIAN_DB_URL: 'wrong-url', XINGLIAN_DB_USERNAME: 'wrong-user', XINGLIAN_DB_PASSWORD: 'inherited-password',
+  } }, output: async (_child, args, directory) => {
+    if (args[0] !== 'install') return;
+    await mkdir(join(directory, 'node_modules/react'), { recursive: true });
+    await writeFile(join(directory, 'node_modules/react/package.json'), '{}');
+  } });
+  await rm(join(deploy.directory, 'node_modules/react'), { recursive: true });
+  const status = await checkedStart(deploy);
+  assert.equal(status.state, 'running'); assert.equal(status.checks.state, 'passed');
+  const backend = deploy.calls.find(call => call.args.includes('spring-boot:run'));
+  assert.equal(backend.config.env.XINGLIAN_DB_URL, 'jdbc:mysql://127.0.0.1:3306/xinglian?characterEncoding=UTF-8&connectionTimeZone=Asia/Shanghai');
+  assert.equal(backend.config.env.XINGLIAN_DB_USERNAME, 'root');
+  const password = backend.config.env.XINGLIAN_DB_PASSWORD;
+  assert.ok(password); assert.notEqual(password, 'inherited-password');
+  for (const call of deploy.calls.filter(call => call !== backend)) {
+    assert.equal(Object.keys(call.config.env).some(key => /^XINGLIAN_DB_/i.test(key)), false);
+  }
+  const child = deploy.children[deploy.calls.indexOf(backend)];
+  child.stdout.emit('data', Buffer.from(`diagnostic ${password.slice(0, 3)}`));
+  child.stdout.emit('data', Buffer.from(`${password.slice(3)}\n`));
+  const serialized = JSON.stringify(await deploy.route('deploy-status'));
+  assert.equal(serialized.includes(password), false);
+  assert.equal(serialized.includes('inherited-password'), false);
+  assert.match(serialized, /REDACTED/);
+  assert.equal(JSON.stringify(deploy.calls.map(call => call.args)).includes(password), false);
+});
+
 test('missing direct dependencies install automatically using lockfile or no-lock fallback', async t => {
   for (const locked of [true, false]) {
     const deploy = await fixture(t, { output: async (_child, args, directory) => {
