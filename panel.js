@@ -1,7 +1,7 @@
 const BASE='/simple-github/api';
 const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
 export function mount(root,options={}){
- const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.4.0';
+ const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.6.0';
  const app=el('main',undefined,'sg-app');root.replaceChildren(link,app);
  let deploy=null,deployTimer,testWindow=null,awaitingTestPage=false;
   function closePendingTestPage(){try{testWindow?.close();}catch{}testWindow=null;awaitingTestPage=false;}
