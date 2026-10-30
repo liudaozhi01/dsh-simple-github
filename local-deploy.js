@@ -7,6 +7,13 @@ import net from 'node:net';
 import http from 'node:http';
 
 const URLS = Object.freeze({ frontend: 'http://127.0.0.1:5180', backend: 'http://127.0.0.1:8081', health: 'http://127.0.0.1:8081/api/v1/health' });
+// Explicitly approved temporary local-deployment configuration; backend service only.
+// Loopback refers to the machine running DSH, not a shared remote MySQL server.
+const LOCAL_DATABASE = Object.freeze({
+  XINGLIAN_DB_URL: 'jdbc:mysql://127.0.0.1:3306/xinglian?characterEncoding=UTF-8&connectionTimeZone=Asia/Shanghai',
+  XINGLIAN_DB_USERNAME: 'root',
+  XINGLIAN_DB_PASSWORD: 'l12345678',
+});
 const fail = (message, status = 409) => Object.assign(new Error(message), { status });
 const same = (a, b) => a && b && a.directory === b.directory && a.head === b.head && a.fingerprint === b.fingerprint;
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -58,7 +65,7 @@ export function createLocalDeploy({ inspect, redact = value => value }, dependen
   const deps = { platform: process.platform, spawn: nodeSpawn, kill: (pid, signal) => process.kill(pid, signal), portAvailable, health, discover, env: process.env, commandTimeout: 10 * 60_000, toolInstallTimeout: 30 * 60_000, readyTimeout: 90_000, pollInterval: 300, killGrace: 500, logLimit: 24_000, ...dependencies };
   const env = normalizeEnv(deps.env, deps.platform);
   for (const key of Object.keys(env)) if (/^(?:GH_|GITHUB_).*TOKEN$|^GITHUB_PAT$|^NODE_OPTIONS$|^NPM_CONFIG_SCRIPT_SHELL$/i.test(key)) delete env[key];
-  const secrets = Object.entries(deps.env).filter(([key, value]) => value && /token|secret|password|api[_-]?key/i.test(key)).map(([, value]) => String(value)).filter(value => value.length >= 4);
+  const secrets = Object.entries({ ...deps.env, __localDatabasePassword: LOCAL_DATABASE.XINGLIAN_DB_PASSWORD }).filter(([key, value]) => value && /token|secret|password|api[_-]?key/i.test(key)).map(([, value]) => String(value)).filter(value => value.length >= 4);
   const sanitize = value => {
     let text = String(value); for (const secret of secrets) text = text.split(secret).join('[REDACTED]');
     return defaultRedact(String(redact(defaultRedact(text))));
@@ -116,6 +123,9 @@ export function createLocalDeploy({ inspect, redact = value => value }, dependen
     // Windows native fs.watch can throw EBUSY on atomic-write staging files.
     // Chokidar (used by Vite) honors these fixed env overrides; scope to frontend.
     const childEnv = { ...env };
+    // Never leak inherited application DB credentials to frontend/install/test commands.
+    for (const key of Object.keys(childEnv)) if (/^XINGLIAN_DB_/i.test(key)) delete childEnv[key];
+    if (label === 'backend' && args.includes('spring-boot:run')) Object.assign(childEnv, LOCAL_DATABASE);
     if (deps.platform === 'win32' && label === 'frontend') {
       childEnv.CHOKIDAR_USEPOLLING = 'true';
       childEnv.CHOKIDAR_INTERVAL = '300';
