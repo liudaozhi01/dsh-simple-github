@@ -8,9 +8,10 @@ function showError(node,text){
 }
 const el=(tag,text,cls)=>{const n=document.createElement(cls==='sg-error'&&tag==='p'?'div':tag);if(text!==undefined){if(cls==='sg-error')showError(n,text);else n.textContent=text;}if(cls)n.className=cls;return n;};
 export function mount(root,options={}){
- const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.8.0';
+ const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.10.0';
  const app=el('main',undefined,'sg-app');root.replaceChildren(link,app);
  let deploy=null,deployTimer,testWindow=null,awaitingTestPage=false;
+ let environment=null,environmentRequest=null;
   function closePendingTestPage(){try{testWindow?.close();}catch{}testWindow=null;awaitingTestPage=false;}
  let state={user:null,csrfToken:null,directory:'',repo:null,busy:false,pushing:false,pushResult:null,pulling:false,pullResult:null,login:null,clone:null,tab:'code',diff:null},disposed=false,timer,cloneTimer,loginGeneration=0;
  const errors=el('div',undefined,'sg-notice');errors.setAttribute('role','status');
@@ -36,7 +37,7 @@ export function mount(root,options={}){
  function section(title){const n=el('section');n.append(el('h3',title.replace(/^\d+ · /,'')));const view=title.includes('账号')||title==='插件远程更新'?'settings':title.includes('本地部署')?'environment':title.includes('共用 dev')||title.includes('提交并推送')?'code':'project';n.hidden=view!==activeView;n.setAttribute('data-view',view);app.append(n);return n;}
  function renderHeader(){
   const header=el('header',undefined,'sg-header'),brand=el('div',undefined,'sg-brand');brand.append(el('span','G','sg-brand-mark'),el('div','GitHub 协作','sg-brand-name'));header.append(brand,el('span',state.busy?'处理中…':'团队开发空间','sg-badge'));
-  const status=el('div',undefined,'sg-context');status.append(el('strong',state.directory?state.directory.replace(/\\/g,'/').split('/').filter(Boolean).at(-1):'尚未选择项目'),el('span',state.repo?.branch||'未打开','sg-branch'),el('span',state.user?.login||'未登录','sg-account'));if(state.directory)status.title=state.directory;
+  const status=el('div',undefined,'sg-context');status.append(el('strong',state.directory?state.directory.replace(/\\/g,'/').split('/').filter(Boolean).at(-1):'尚未选择项目'),el('span',state.repo?.branch||'未打开','sg-branch'),el('span',state.user?.name||state.user?.login||'未登录','sg-account'));if(state.directory)status.title=state.directory;
   const nav=el('nav',undefined,'sg-nav');nav.setAttribute('aria-label','协作功能');for(const [view,label] of Object.entries(viewNames)){const tab=el('button',label,view===activeView?'sg-nav-active':'');tab.type='button';tab.setAttribute('aria-current',view===activeView?'page':'false');tab.onclick=()=>{activeView=view;render();};nav.append(tab);}
   app.append(header,status,nav,errors);
   if((activeView==='code'||activeView==='environment')&&!state.repo){const empty=el('div',undefined,'sg-empty');empty.append(el('h3','先打开一个项目'),el('p','选择本地项目或克隆团队 dev 分支，即可开始协作。','sg-muted'));const open=el('button','选择项目','sg-primary');open.onclick=()=>{activeView='project';render();};empty.append(open);app.append(empty);}
@@ -109,7 +110,7 @@ export function mount(root,options={}){
   const host=state.platformInfo,isWindows=host?.isWindows===true,isMac=host?.platform==='darwin';
   const account=section('1 · GitHub 账号');
   account.append(el('p','DSH 宿主系统：'+(host?.label||'尚未检测')+'（以运行 DSH 的电脑为准，不是浏览器系统）','sg-muted'));
-  if(state.user){account.append(row(el('strong','已登录：'+state.user.login),button('刷新',refreshStatus),button('退出登录',async()=>{if(!confirm('退出本机 GitHub CLI 的当前账号？这也会影响其他使用 gh 的工具。'))return;++loginGeneration;clearTimeout(timer);await api('/logout',{});await refreshStatus();message('已退出登录。');})));}
+  if(state.user){account.append(row(el('strong','已登录：'+(state.user.name?state.user.name+'（@'+state.user.login+'）':state.user.login)),button('刷新',refreshStatus),button('退出登录',async()=>{if(!confirm('退出本机 GitHub CLI 的当前账号？这也会影响其他使用 gh 的工具。'))return;++loginGeneration;clearTimeout(timer);await api('/logout',{});await refreshStatus();message('已退出登录。');})));}
   else{
    account.append(el('p','点击登录，在 GitHub 官方网页完成授权。无需配置 SSH。'));
    if(state.ghAvailable===false){const install=isWindows?'请在 PowerShell 或终端运行 winget install --id GitHub.cli --exact。':isMac?'请在终端运行 brew install gh。':'请安装适合 DSH 宿主系统的官方 GitHub CLI（gh）。';account.append(el('p','DSH 宿主未找到 GitHub CLI（gh）。'+install+'安装后完全退出并重新启动 DSH，再检查登录状态，以加载更新后的 PATH。','sg-error'));}
@@ -121,7 +122,8 @@ export function mount(root,options={}){
      if(state.login.url)account.append(external('打开 GitHub 授权页面 ↗',state.login.url));
    }
   }
-  const project=section('2 · 项目');
+  renderEnvironmentSetup();
+   const project=section('2 · 项目');
   const pathExample=isWindows?'C:\\Users\\你的名字\\Projects\\XiAN-OA':isMac?'/Users/你的名字/Projects/XiAN-OA':'/home/你的名字/Projects/XiAN-OA';
   const dirPlaceholder='项目文件夹绝对路径，例如 '+pathExample;const dir=input(dirPlaceholder,drafts.get('project-directory')??state.directory,'project-directory');
   dir.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();void run(()=>openProject(dir.value));}};
@@ -141,7 +143,19 @@ export function mount(root,options={}){
   renderUpdate();
    app.setAttribute('aria-busy',String(state.busy));if(focusKey&&!state.busy){const target=[...(app.querySelectorAll?.('input,textarea')||[])].find(n=>n.sgDraftKey===focusKey);target?.focus();if(selection)target?.setSelectionRange(...selection);}
  }
- async function refreshDeploy(){const directory=state.directory;const result=await api('/deploy-status',{directory});if(disposed||directory!==state.directory)return;const previous=deploy;deploy=result;
+ function renderEnvironmentSetup(){
+   const box=section('开发环境初始化');box.append(el('p','首次使用？先检测运行 DSH 的电脑，再请当前会话的 AI 帮你配置。无需先安装 Git、登录或打开项目。检测不会安装软件。','sg-muted'));
+   box.append(row(button('检测开发环境',async()=>{environment=await api('/environment-inspect',{});message('开发环境检测完成；检测到工具不代表项目已能运行，请核对版本要求。');},true),button('请 AI 帮我配置',async()=>{
+    const sessionId=options.getSessionId?.();if(!sessionId)throw new Error('请先打开并保持当前 AI 会话，再发送环境初始化请求。');
+    if(!confirm('将重新检测 DSH 宿主的系统、架构及开发工具版本，并发送到当前 AI 会话。AI 会先核对配置方案；安装软件、管理员权限或修改系统设置仍需本人确认。不自动配置数据库、克隆或启动项目。是否发送？'))return;
+    if(options.getSessionId?.()!==sessionId)throw new Error('当前会话已切换，请在目标会话重新发送。');
+    if(!environmentRequest||environmentRequest.sessionId!==sessionId)environmentRequest={sessionId,requestId:globalThis.crypto.randomUUID()};
+    const result=await api('/environment-notify',environmentRequest);message(result.duplicate?'此初始化请求已发送，请查看当前 AI 会话。':'已发送到当前 AI 会话，请按 AI 提示确认操作；完成后点击“检测开发环境”重新验证。');environmentRequest=null;
+   })));
+   if(environment){box.append(el('p','DSH 宿主：'+environment.platform+' · '+environment.arch,'sg-muted'));const list=el('ul');for(const tool of environment.tools||[])list.append(el('li',tool.label+' · '+(tool.available?(tool.version||'已检测到'):'未检测到')+(tool.required?'':'（按需）')));box.append(list);for(const item of environment.requirements||[])if(!item.satisfied)box.append(el('p',item.label,'sg-warning'));}
+   box.append(el('p','仅发送工具与版本信息，不发送密码、Token 或完整环境变量。新安装工具可能需要重启 DSH 才能识别；数据库连接请单独向负责人确认。','sg-muted'));
+  }
+  async function refreshDeploy(){const directory=state.directory;const result=await api('/deploy-status',{directory});if(disposed||directory!==state.directory)return;const previous=deploy;deploy=result;
    const ready=result.state==='running'&&result.frontend?.ready&&result.backend?.ready;
    if(ready&&awaitingTestPage){awaitingTestPage=false;let opened=false;try{if(testWindow&&!testWindow.closed){testWindow.location.replace('http://127.0.0.1:5180');opened=true;}}catch{}testWindow=null;message(opened?'✓ 本地环境启动成功，前后端已就绪，已自动打开测试页。请完成页面自测。':'✓ 本地环境启动成功，前后端已就绪。浏览器未允许自动打开，请点击“打开本地测试页面”。');}
    else if(result.state==='failed'){if(awaitingTestPage)closePendingTestPage();if(previous?.state!=='failed'||previous?.error!==result.error)message('本地环境启动或运行失败：'+(result.error||'请查看运行日志'),true);}

@@ -121,7 +121,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
   async function gh(args, options = {}) { return command(await executable(), args, { env: cleanEnv, ...options }); }
   async function git(directory, args, options = {}) { return command('git', ['--no-optional-locks', '-C', directory, ...args], { env: cleanEnv, ...options }); }
   const out = async (dir, args) => (await git(dir, args)).stdout.trim();
-  async function user() { try { const data = JSON.parse((await gh(['api', 'user', '--hostname', 'github.com'])).stdout); return { login: text(data.login, 'GitHub login', 100), avatarUrl: /^https:\/\/avatars\.githubusercontent\.com\//.test(data.avatar_url) ? data.avatar_url : '' }; } catch { return null; } }
+  async function user() { try { const data = JSON.parse((await gh(['api', 'user', '--hostname', 'github.com'])).stdout); return { login: text(data.login, 'GitHub login', 100), name: typeof data.name === 'string' ? data.name.trim().slice(0, 200) : '', avatarUrl: /^https:\/\/avatars\.githubusercontent\.com\//.test(data.avatar_url) ? data.avatar_url : '' }; } catch { return null; } }
   async function root(value) {
     text(value, 'directory'); if (!isAbsolute(value)) throw new ApiError('Directory must be absolute');
     const directory = await realpath(value); if (!(await stat(directory)).isDirectory()) throw new ApiError('Directory does not exist');
