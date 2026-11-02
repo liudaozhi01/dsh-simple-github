@@ -1,14 +1,21 @@
+import {errorFeedback} from './error-feedback.js';
 const BASE='/simple-github/api';
-const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n;};
+function showError(node,text){
+ const feedback=errorFeedback(text);node.textContent=feedback.message;
+ const details=document.createElement('details'),summary=document.createElement('summary'),pre=document.createElement('pre');
+ summary.textContent='技术详情（可选中文字复制）';pre.textContent='错误分类：'+feedback.code+'\n原始信息：'+feedback.detail;
+ details.append(summary,pre);node.append(details);
+}
+const el=(tag,text,cls)=>{const n=document.createElement(cls==='sg-error'&&tag==='p'?'div':tag);if(text!==undefined){if(cls==='sg-error')showError(n,text);else n.textContent=text;}if(cls)n.className=cls;return n;};
 export function mount(root,options={}){
- const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.6.0';
+ const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.7.0';
  const app=el('main',undefined,'sg-app');root.replaceChildren(link,app);
  let deploy=null,deployTimer,testWindow=null,awaitingTestPage=false;
   function closePendingTestPage(){try{testWindow?.close();}catch{}testWindow=null;awaitingTestPage=false;}
  let state={user:null,csrfToken:null,directory:'',repo:null,busy:false,pushing:false,pushResult:null,pulling:false,pullResult:null,login:null,clone:null,tab:'code',diff:null},disposed=false,timer,cloneTimer,loginGeneration=0;
  const errors=el('div',undefined,'sg-notice');errors.setAttribute('role','status');
  function displayText(value){return String(value).replace(/https:\/\/github\.com\/[^\s'"<>]+/gi,'[团队仓库]');}
-  function message(text,bad=false){errors.textContent=displayText(text);errors.className='sg-notice '+(bad?'sg-error':'sg-success');}
+  function message(text,bad=false){errors.replaceChildren();if(bad)showError(errors,displayText(text));else errors.textContent=displayText(text);errors.className='sg-notice '+(bad?'sg-error':'sg-success');}
  async function api(path,body){
   const r=await fetch(BASE+path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-Simple-Git-Token':state.csrfToken||''},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(180000)});
   const data=await r.json();if(!r.ok||data.ok===false)throw new Error(data.error||'请求失败 HTTP '+r.status);return data;

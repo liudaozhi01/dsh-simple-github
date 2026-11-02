@@ -18,7 +18,7 @@ export function apply(ctx) {
     try {
       checkRequest(req, { port: ctx.webServer.port, csrfVerified: service.tokenMatches(req.headers['x-simple-git-token']) });
       const url = new URL(req.url, 'http://localhost');
-      const assets = { '/simple-github/auto-install.js': ['auto-install.js','text/javascript; charset=utf-8'], '/simple-github/panel.js': ['panel.js','text/javascript; charset=utf-8'], '/simple-github/panel.css': ['panel.css','text/css; charset=utf-8'] };
+      const assets = { '/simple-github/error-feedback.js': ['error-feedback.js','text/javascript; charset=utf-8'], '/simple-github/auto-install.js': ['auto-install.js','text/javascript; charset=utf-8'], '/simple-github/panel.js': ['panel.js','text/javascript; charset=utf-8'], '/simple-github/panel.css': ['panel.css','text/css; charset=utf-8'] };
       if (assets[url.pathname]) {
         if (req.method !== 'GET') throw new ApiError('GET required', 405);
         const [file, type] = assets[url.pathname]; const data = await readFile(new URL(file, import.meta.url));
