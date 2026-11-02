@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
     const ref=React.useRef(null);
     React.useEffect(()=>{
      let cancelled=false,dispose;
-     Promise.all([import('/simple-github/panel.js?v=0.7.0'),import('/simple-github/auto-install.js?v=0.7.0')]).then(([module,installer])=>{
+     Promise.all([import('/simple-github/panel.js?v=0.8.0'),import('/simple-github/auto-install.js?v=0.8.0')]).then(([module,installer])=>{
       const autoInstaller=installer.createAutoInstaller(ctx.remote.pluginManager);
       if(!cancelled&&ref.current)dispose=module.mount(ref.current,{autoInstaller,getSessionId:()=>{const active=ctx.sidebarRight.mounted.getSnapshot();return sessionId&&active===sessionId?sessionId:null;}});
      }).catch(error=>{if(!cancelled&&ref.current)ref.current.textContent='GitHub 面板加载失败：'+error.message;});

@@ -8,7 +8,7 @@ function showError(node,text){
 }
 const el=(tag,text,cls)=>{const n=document.createElement(cls==='sg-error'&&tag==='p'?'div':tag);if(text!==undefined){if(cls==='sg-error')showError(n,text);else n.textContent=text;}if(cls)n.className=cls;return n;};
 export function mount(root,options={}){
- const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.7.0';
+ const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.8.0';
  const app=el('main',undefined,'sg-app');root.replaceChildren(link,app);
  let deploy=null,deployTimer,testWindow=null,awaitingTestPage=false;
   function closePendingTestPage(){try{testWindow?.close();}catch{}testWindow=null;awaitingTestPage=false;}
@@ -31,7 +31,16 @@ export function mount(root,options={}){
  async function pickDirectory(field,autoOpen=false){const result=await api('/choose-directory',{});if(disposed||result.cancelled)return;drafts.set(field.sgDraftKey,result.directory);if(autoOpen)await openProject(result.directory);else message('已选择保存目录，点击“克隆并打开”开始克隆。');}
   async function openProject(directory){state.directory=directory.trim();resetProject();await inspect();message('项目已打开。');}
  function resetProject(){closePendingTestPage();noticeStatus='';notified.clear();message('');deploy=null;clearTimeout(deployTimer);state.pushResult=null;state.pullResult=null;state.repo=null;state.diff=null;drafts.clear();}
- function section(title){const n=el('section');n.append(el('h3',title));app.append(n);return n;}
+ let activeView='project';
+ const viewNames={project:'项目',code:'代码同步',environment:'本地环境',settings:'设置'};
+ function section(title){const n=el('section');n.append(el('h3',title.replace(/^\d+ · /,'')));const view=title.includes('账号')||title==='插件远程更新'?'settings':title.includes('本地部署')?'environment':title.includes('共用 dev')||title.includes('提交并推送')?'code':'project';n.hidden=view!==activeView;n.setAttribute('data-view',view);app.append(n);return n;}
+ function renderHeader(){
+  const header=el('header',undefined,'sg-header'),brand=el('div',undefined,'sg-brand');brand.append(el('span','G','sg-brand-mark'),el('div','GitHub 协作','sg-brand-name'));header.append(brand,el('span',state.busy?'处理中…':'团队开发空间','sg-badge'));
+  const status=el('div',undefined,'sg-context');status.append(el('strong',state.directory?state.directory.replace(/\\/g,'/').split('/').filter(Boolean).at(-1):'尚未选择项目'),el('span',state.repo?.branch||'未打开','sg-branch'),el('span',state.user?.login||'未登录','sg-account'));if(state.directory)status.title=state.directory;
+  const nav=el('nav',undefined,'sg-nav');nav.setAttribute('aria-label','协作功能');for(const [view,label] of Object.entries(viewNames)){const tab=el('button',label,view===activeView?'sg-nav-active':'');tab.type='button';tab.setAttribute('aria-current',view===activeView?'page':'false');tab.onclick=()=>{activeView=view;render();};nav.append(tab);}
+  app.append(header,status,nav,errors);
+  if((activeView==='code'||activeView==='environment')&&!state.repo){const empty=el('div',undefined,'sg-empty');empty.append(el('h3','先打开一个项目'),el('p','选择本地项目或克隆团队 dev 分支，即可开始协作。','sg-muted'));const open=el('button','选择项目','sg-primary');open.onclick=()=>{activeView='project';render();};empty.append(open);app.append(empty);}
+ }
  function row(...nodes){const n=el('div',undefined,'sg-row');n.append(...nodes);return n;}
  function external(label,url){const n=el('a',label);try{const u=new URL(url);if(u.protocol==='https:'&&u.hostname==='github.com'){n.href=u.href;n.target='_blank';n.rel='noopener noreferrer';}}catch{}return n;}
  async function run(action){if(state.busy||state.clone?.state==='running'||disposed)return;state.busy=true;render();try{await action();}catch(e){message(e.message,true);}finally{state.busy=false;if(!disposed)render();}}
@@ -96,7 +105,7 @@ export function mount(root,options={}){
   try{const s=await api('/login?id='+encodeURIComponent(id));if(disposed||generation!==loginGeneration)return;const changed=JSON.stringify(state.login)!==JSON.stringify(s);state.login=s;if(s.state==='success'){await refreshStatus(generation);if(disposed||generation!==loginGeneration)return;state.login=null;message('已登录 GitHub，可以选择项目了。');render();return;}if(s.state==='error'){message(s.error||'登录失败，请重试。',true);render();return;}if(changed&&!state.busy)render();timer=setTimeout(()=>pollLogin(id,generation),2000);}catch(e){if(!disposed&&generation===loginGeneration){message('登录状态检查暂时失败，将自动重试：'+e.message,true);timer=setTimeout(()=>pollLogin(id,generation),4000);}}
  }
  function render(){
-  if(disposed)return;const focused=app.contains(document.activeElement)?document.activeElement:null;const focusKey=focused?.sgDraftKey,selection=focused&&typeof focused.selectionStart==='number'?[focused.selectionStart,focused.selectionEnd]:null;for(const node of app.querySelectorAll?.('details')||[]){if(node.sgDisclosureKey)disclosureState.set(node.sgDisclosureKey,node.open);}app.replaceChildren();app.append(el('h2','GitHub 协作'),el('p','打开项目 → 从 dev 拉取 → 开发 → 本地部署与自测 → 提交推送','sg-muted'),errors);
+  if(disposed)return;const focused=app.contains(document.activeElement)?document.activeElement:null;const focusKey=focused?.sgDraftKey,selection=focused&&typeof focused.selectionStart==='number'?[focused.selectionStart,focused.selectionEnd]:null;for(const node of app.querySelectorAll?.('details')||[]){if(node.sgDisclosureKey)disclosureState.set(node.sgDisclosureKey,node.open);}app.replaceChildren();renderHeader();
   const host=state.platformInfo,isWindows=host?.isWindows===true,isMac=host?.platform==='darwin';
   const account=section('1 · GitHub 账号');
   account.append(el('p','DSH 宿主系统：'+(host?.label||'尚未检测')+'（以运行 DSH 的电脑为准，不是浏览器系统）','sg-muted'));
