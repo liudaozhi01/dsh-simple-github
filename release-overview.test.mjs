@@ -31,13 +31,13 @@ with tempfile.TemporaryDirectory() as d:
   r.put('job','f'*32,dict(jobId='f'*32,actor='bob',environment='dev',status='accepted',stage='awaiting-acceptance',createdAt=200,releaseId='f'*32,head='a'*40,images={'api':'sha256:'+'a'*64,'web':'sha256:'+'b'*64}))
   r.put('release','f'*32,dict(releaseId='f'*32,accepted=True,environment='dev'))
   result=r.overview({});assert len(result['jobs'])==20 and result['releaseId']=='f'*32
-  assert all(j['actor']=='alice' for j in result['jobs'])
-  assert result['jobs'][0]['jobId']==f'{24:032x}'
+  assert any(j['actor']=='bob' for j in result['jobs'])
+  assert result['jobs'][0]['jobId']=='f'*32
   assert 'supersecret' not in json.dumps(result) and 'workerToken' not in json.dumps(result) and 'bundle' not in json.dumps(result)
   for i in range(30):
    key=f'{100+i:032x}';r.put('job',key,dict(jobId=key,actor='alice',environment='test',status='failed',stage='preflight',createdAt=1000+i))
   onlydev=r.overview({'authorizedEnvironments':['dev']});assert len(onlydev['jobs'])==20 and all(j['environment']=='dev' for j in onlydev['jobs'])
-  j=result['jobs'][0];assert j['errorCode']=='BUILD_FAILED' and j['updatedAt']>=j['createdAt'] and j['elapsedSeconds']>=0
+  j=next(j for j in result['jobs'] if j['status']=='failed');assert j['errorCode']=='BUILD_FAILED' and j['updatedAt']>=j['createdAt'] and j['elapsedSeconds']>=0
   assert j['errorSummary']==j['error']
   assert r.public_job(dict(jobId='a'*32,actor='alice',environment='dev',status='running',stage='applying',createdAt=int(time.time())-2))['stage']=='applying'
   c={'profile':{'stateRoot':d},'allowedUsers':{'dev':['alice'],'test':['reviewer']}}
@@ -45,7 +45,8 @@ with tempfile.TemporaryDirectory() as d:
   assert broker.environment({'action':'overview','body':{}},'alice')=='dev'
   assert broker.public_overview(result,'alice')['releaseId'] is None
   assert broker.public_overview(result,'reviewer')['releaseId']=='f'*32
-  assert broker.public_overview(result,'reviewer')['jobs']==[]
+  assert broker.public_overview(result,'reviewer')['jobs']==result['jobs']
+  assert broker.public_overview(result,'alice')['jobs']==result['jobs']
   try:broker.environment({'action':'overview','body':{}},'nobody');raise AssertionError('unauthorized')
   except b.Refused:pass
   for action in ('status','reconcile','accept'):
@@ -55,7 +56,7 @@ with tempfile.TemporaryDirectory() as d:
   assert b.request_object(b'{"action":"overview","body":{}}')['action']=='overview'
   try:b.request_object(b'{"action":"overview","body":{"actor":"bob"}}');raise AssertionError('spoof')
   except b.Refused:pass
-print('bounded own jobs, test-only release visibility, fixed errors, stage/timing and peer ACL passed')
+print('bounded shared jobs, test-only release visibility, fixed errors, stage/timing and peer ACL passed')
 `;
  const p=spawnSync('python3',['-c',script],{cwd:fileURLToPath(new URL('.',import.meta.url)),encoding:'utf8'});
  assert.equal(p.status,0,p.stdout+p.stderr);

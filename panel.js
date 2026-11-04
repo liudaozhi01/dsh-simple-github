@@ -10,7 +10,7 @@ export function mount(root,options={}){
   details.append(summary,pre);node.append(details);
  }
  function el(tag,text,cls){const n=makeElement(cls==='sg-error'&&tag==='p'?'div':tag,cls==='sg-error'?undefined:text,cls);if(cls==='sg-error'&&text!==undefined)showError(n,text);return n;}
- const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.15.5';
+ const link=el('link');link.rel='stylesheet';link.href='/simple-github/panel.css?v=0.15.6';
  const app=el('main',undefined,'sg-app');root.replaceChildren(link,app);
  let environment=null,environmentRequest=null;
  let state={user:null,csrfToken:null,directory:'',repo:null,busy:false,pushing:false,pushResult:null,pulling:false,pullResult:null,login:null,clone:null,tab:'code',diff:null},disposed=false,timer,cloneTimer,loginGeneration=0;
@@ -175,11 +175,13 @@ export function mount(root,options={}){
    }catch(error){if(!disposed){remoteFailures++;remoteProblem='状态获取失败：'+error.message+'。不会自动重发部署；请恢复连接后核对。';}}
    finally{remoteLoading=false;if(!disposed){render();scheduleRemote();}}
   }
+  const canManageRelease=()=>['刘道志','於天晨'].includes(state.user?.name);
   async function publishRemote(environment){
+   if(environment==='test'&&!canManageRelease())return;
    if(remotePhase||remoteActive(dockerJob)||remoteHistory.some(remoteActive)||remoteUncertain)return;
    remotePhase='正在获取发布计划';remoteProblem='';render();
    try{
-    if(environment==='test'){await refreshRemote();if(!remoteReleaseId)throw new Error('没有可发布的成功 dev 版本，或当前 SSH 账号无 test 发布权限（仅 liudaozhi）。dev 启动成功即可，无需登记业务验收。');}
+    if(environment==='test'){await refreshRemote();if(!remoteReleaseId)throw new Error('没有可发布的成功 dev 版本，或当前 SSH 账号无 test 发布权限。dev 启动成功即可，无需登记业务验收。');}
     const plan=await api(environment==='dev'?'/docker-plan':'/docker-promote',environment==='dev'?{}:{releaseId:remoteReleaseId});if(disposed)return;
     if(!plan.planId)throw new Error('服务器没有返回有效发布计划');
     const version=plan.head||plan.remote?.head;
@@ -190,6 +192,7 @@ export function mount(root,options={}){
    }catch(error){if(!disposed)remoteProblem='发布未启动：'+error.message;}finally{remotePhase='';if(!disposed){render();scheduleRemote();}}
   }
   async function restoreRemote(job){
+   if(!canManageRelease())return;
    if(remotePhase||remoteActive(dockerJob)||remoteHistory.some(remoteActive)||remoteUncertain)return;
    const environment=job.environment;remotePhase='正在核对历史版本镜像';remoteProblem='';render();
    try{
@@ -204,10 +207,10 @@ export function mount(root,options={}){
   function environmentLink(environment){const link=el('a','打开 '+environment+' 网站 ↗');link.href=environment==='dev'?'http://119.45.50.213:18081/':'http://119.45.50.213/';link.target='_blank';link.rel='noopener noreferrer';return link;}
   function renderRemoteDeploy(){
    const box=section('dev 远程部署');box.className='sg-remote-deploy';box.children[0].textContent='远程部署';
-   const help=disclosure('release-help');help.append(el('summary','发布说明与权限'),el('p','dev：普通 SSH 成员可发布；test：仅 liudaozhi，复用成功 dev 镜像。两环境数据库独立；恢复只切换程序，不撤销数据库变更。','sg-muted'));box.append(help);
+   const help=disclosure('release-help');help.append(el('summary','发布说明与权限'),el('p','dev：普通 SSH 成员可发布；test 与历史恢复按钮：仅刘道志、於天晨显示；test 复用成功 dev 镜像。两环境数据库独立；恢复只切换程序，不撤销数据库变更。','sg-muted'));box.append(help);
    const dev=button('发布 dev',()=>publishRemote('dev'),true),test=button('发布 test',()=>publishRemote('test'));
    if(remotePhase||remoteActive(dockerJob)||remoteHistory.some(remoteActive)||remoteUncertain){dev.disabled=true;test.disabled=true;}
-   box.append(row(dev,test));
+   box.append(canManageRelease()?row(dev,test):row(dev));
     box.append(row(environmentLink('dev'),environmentLink('test')));help.append(el('p','网站链接访问当前环境，不一定是所选历史版本。','sg-muted'));
    const status=el('div',undefined,'sg-release-status');status.setAttribute('role','status');status.setAttribute('aria-live','polite');
    status.append(el('h4','部署情况'));
@@ -225,7 +228,7 @@ export function mount(root,options={}){
    }else if(!remotePhase)status.append(el('p',remoteLoaded?'暂无部署记录':'打开后自动读取服务器部署状态','sg-muted'));
    if(remoteProblem||remoteUncertain||dockerJob?.status==='uncertain')status.append(button('重新核对状态',async()=>{if(!remoteUncertain&&dockerJob?.jobId)rememberRemote(await api('/docker-reconcile',{jobId:dockerJob.jobId}));remoteFailures=0;await refreshRemote();}));
    box.append(status);
-    for(const environment of ['dev','test']){const jobs=remoteHistory.filter(job=>job.environment===environment&&job.status==='delivered'&&job.head);if(!jobs.length)continue;const history=disclosure('release-history-'+environment);history.className='sg-release-history';history.append(el('summary',environment+' 版本历史（'+jobs.length+'）'));for(const job of jobs){const entry=el('div',undefined,'sg-release-history-row');const restore=button('恢复到此版本',()=>restoreRemote(job));restore.disabled=state.busy||!!remotePhase||remoteActive(dockerJob)||remoteHistory.some(remoteActive)||remoteUncertain;const info=el('div',undefined,'sg-release-history-info');info.append(el('code',job.head.slice(0,12),'sg-release-version'),el('span',job.actor||'服务器记录','sg-release-actor'),el('time',job.createdAt?new Date(job.createdAt*1000).toLocaleString('zh-CN',{hour12:false}):'时间待确认','sg-release-time'));entry.append(info,restore);history.append(entry);}box.append(history);}
+    for(const environment of ['dev','test']){const jobs=remoteHistory.filter(job=>job.environment===environment&&job.status==='delivered'&&job.head);if(!jobs.length)continue;const history=disclosure('release-history-'+environment);history.className='sg-release-history';history.append(el('summary',environment+' 版本历史（'+jobs.length+'）'));for(const job of jobs){const entry=el('div',undefined,'sg-release-history-row');const restore=button('恢复到此版本',()=>restoreRemote(job));restore.disabled=state.busy||!!remotePhase||remoteActive(dockerJob)||remoteHistory.some(remoteActive)||remoteUncertain;const info=el('div',undefined,'sg-release-history-info');info.append(el('code',job.head.slice(0,12),'sg-release-version'),el('span',job.actor||'服务器记录','sg-release-actor'),el('time',job.createdAt?new Date(job.createdAt*1000).toLocaleString('zh-CN',{hour12:false}):'时间待确认','sg-release-time'));entry.append(info);if(canManageRelease())entry.append(restore);history.append(entry);}box.append(history);}
    if(activeView==='remote'&&!remoteLoaded&&!remoteLoading&&!remoteFailures&&!state.busy)queueMicrotask(()=>void refreshRemote());
   }
   function renderEnvironmentSetup(){

@@ -601,7 +601,7 @@ class Release:
         for n, path in enumerate(self.state.glob('job-*.json')):
             require(n < 4096, 'Too many jobs; query explicit jobId')
             job = loads(secure(path).read_text())
-            if job.get('actor') == self.user and job.get('environment') in environments:
+            if job.get('environment') in environments:
                 jobs.append(job)
             if self.promotion_source(job):
                 releases.append(job)
