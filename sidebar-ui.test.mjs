@@ -7,6 +7,19 @@ class Element{
  setAttribute(k,v){this.attributes[k]=v;}contains(n){return this===n||this.children.some(c=>c.contains(n));}querySelectorAll(){return [];}
 }
 const all=n=>[n,...n.children.flatMap(all)];
+for(const mode of ['success','failure','no-session'])test('errors remain local without session notifications: '+mode,async()=>{
+ const old={document:globalThis.document,fetch:globalThis.fetch};let dispose;const calls=[];
+ globalThis.document={createElement:tag=>new Element(tag)};
+ globalThis.fetch=async(url,opts={})=>{calls.push({url,body:opts.body&&JSON.parse(opts.body)});if(url.endsWith('/error-notify')&&mode==='failure')throw new Error('notice transport failed');return {ok:true,json:async()=>url.endsWith('/status')?{csrfToken:'csrf'}:url.endsWith('/update-check')?{ok:false,error:'Failed to fetch token=private-value'}:{ok:true,notified:true}};};
+ const tick=()=>new Promise(r=>setImmediate(r));
+ try{
+  const root=new Element('root');dispose=mount(root,{getSessionId:()=>mode==='no-session'?null:'session1'});await tick();await tick();
+  all(root).find(n=>n.tagName==='nav').children.find(n=>n.textContent==='设置').onclick();await tick();
+   assert.equal(calls.filter(c=>c.url.endsWith('/error-notify')).length,0);
+   const text=all(root).map(n=>n.textContent).join('\n');assert.doesNotMatch(text,/自动发送|报错未发送|private-value/);
+  assert.ok(all(root).some(n=>n.textContent==='技术详情（可选中文字复制）'));
+ }finally{dispose?.();Object.assign(globalThis,old);}
+});
 for(const name of ['刘道志','',null])test('account display name fallback: '+String(name),async()=>{
  const old={document:globalThis.document,fetch:globalThis.fetch};let dispose;
  globalThis.document={createElement:tag=>new Element(tag)};globalThis.fetch=async url=>({ok:true,json:async()=>url.endsWith('/status')?{csrfToken:'csrf',user:{login:'liudaozhi01',name}}:{available:false}});
@@ -26,7 +39,7 @@ test('navigation changes visible sections without API calls and preserves projec
  assert.deepEqual(sections(),['project','project']);const field=all(root).find(n=>n.sgDraftKey==='project-directory');field.value='/draft';field.oninput();
  const before=calls.length;const select=view=>all(root).find(n=>n.tagName==='nav').children.find(n=>n.textContent===view).onclick();
  select('设置');assert.deepEqual(sections(),['settings','settings']);
- select('项目');assert.equal(all(root).filter(n=>n.tagName==='section'&&!n.hidden)[0].children[0].textContent,'开发环境初始化');select('本地环境');assert.deepEqual(sections(),[]);select('代码同步');assert.deepEqual(sections(),[]);assert.ok(all(root).some(n=>n.textContent==='先打开一个项目'));
+ select('项目');assert.equal(all(root).filter(n=>n.tagName==='section'&&!n.hidden)[0].children[0].textContent,'开发环境初始化');assert.ok(!all(root).some(n=>n.tagName==='button'&&n.textContent==='本地环境'));select('代码同步');assert.deepEqual(sections(),[]);assert.ok(all(root).some(n=>n.textContent==='先打开一个项目'));
  select('项目');assert.equal(all(root).find(n=>n.sgDraftKey==='project-directory').value,'/draft');assert.equal(calls.length,before);
  }finally{dispose?.();Object.assign(globalThis,old);}
 });

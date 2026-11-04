@@ -1,3 +1,18 @@
 - insert:
     - id: local-simple-github
       name: '@local/dsh-simple-github'
+      config:
+        releaseProfile:
+          repository: ssal-team/xian-oa
+          branch: dev
+          target: { alias: xian-oa-test, host: 119.45.50.213, user: liudaozhi, port: 22 }
+          roots: { dev: /opt/xian-oa-dev-docker, test: /opt/xian-oa-test-docker }
+          projects: { dev: xian-oa-dev, test: xian-oa-test }
+          stateRoot: /var/lib/xian-oa-team-release
+          # Compatibility fields only: the server's Unix policy is authoritative.
+          allowedNames: { dev: [刘道志], test: [刘道志] }
+          baseImages:
+            node: mirror.ccs.tencentyun.com/library/node@sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2
+            mavenJava21: mirror.ccs.tencentyun.com/library/maven@sha256:80034909d9a9f0b89d3d2c583f07f3b7650309bc4e6b886ad5b860b9e1bfa439
+            java: mirror.ccs.tencentyun.com/library/eclipse-temurin@sha256:0b99b3376fbb50dbf9c0af8535fdd5b8eb0d3fdfc8b1e4967f383b6919f6901a
+            nginx: mirror.ccs.tencentyun.com/library/nginx@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236

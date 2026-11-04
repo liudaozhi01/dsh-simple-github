@@ -1,10 +1,10 @@
 {
   "name": "@local/dsh-simple-github",
-  "version": "0.10.0",
+  "version": "0.15.5",
   "description": "简洁 GitHub 团队协作：网页登录、提交推送、PR 合并",
   "type": "module",
   "exports": {".": "./index.js", "./client": "./client.js"},
-  "files": ["environment-setup.js", "error-feedback.js", "auto-install.js", "remote-update.js", "index.js", "core.js", "platform.js", "windows-tools.js", "local-deploy.js", "conflict-notice.js", "client.js", "panel.js", "panel.css", "cordis.patch.yml", "README.md"],
+  "files": ["team-release-broker.py", "team-release-entry.py", "team-release-build.py", "team-release-README.md", "local-source-bundle.js", "release-profile.js", "temporary-release-client.js", "temporary-release.py", "temporary-release-README.md", "server-release-client.js", "server-release.py", "server-release-README.md", "docker-server-config.js", "docker-ssh.js", "docker-runtime.js", "docker-apply.js", "docker-reconcile.js", "docker-journal.js", "docker-pipeline.js", "docker-publish.js", "docker-delivery.js", "remote-source.js", "docker-build.js", "docker-executor.js", "docker-plan.js", "docker-preview.js", "docker-release.js", "native-dev-deploy.js", "remote-deploy.js", "environment-setup.js", "error-feedback.js", "auto-install.js", "remote-update.js", "index.js", "core.js", "platform.js", "windows-tools.js", "local-deploy.js", "conflict-notice.js", "client.js", "panel.js", "panel.css", "cordis.patch.yml", "README.md"],
   "scripts": {"test": "node test-runner.mjs"},
   "dsh": {"bundle": {"patch": "./cordis.patch.yml"}, "client": {"platform": "web", "inject": ["@deepseek-ai/dsh-client-ui-sidebar-right"]}},
   "license": "MIT"

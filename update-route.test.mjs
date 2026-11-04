@@ -12,7 +12,7 @@ test('update routes retain loopback, origin, method and CSRF guards', async () =
     let status,body;await handler(req,{setHeader(){},writeHead:s=>status=s,end:s=>body=JSON.parse(s)});return {status,body};
   }
   try {
-    for(const path of ['update-check','update-install']) {
+    for(const path of ['docker-status','docker-accept','docker-reconcile','docker-start','docker-plan','docker-promote','docker-preview','error-notify','update-check','update-install','remote-dev-check','remote-dev-start','remote-dev-status']) {
       assert.equal((await request(path)).status,403);
       assert.equal((await request(path,{method:'GET'})).status,405);
       assert.equal((await request(path,{headers:{origin:'https://evil.example'}})).status,403);

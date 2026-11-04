@@ -4,13 +4,26 @@ import { API_BASE, ApiError, checkRequest, createService, readJson, redact, choo
 import { createConflictNotifier } from './conflict-notice.js';
 import { createRemoteUpdater } from './remote-update.js';
 import { createEnvironmentSetup } from './environment-setup.js';
+import { createRemoteDeploy } from './remote-deploy.js';
+import { createNativeDevDeploy } from './native-dev-deploy.js';
+import { createDockerPreview } from './docker-preview.js';
+import { createTemporaryReleaseClient } from './temporary-release-client.js';
+import { createLocalSourceBundle } from './local-source-bundle.js';
 export const inject = ['webServer'];
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
+  // Trusted startup capability only; never read runtime/config from HTTP input.
   const service = createService();
+  const dockerRuntime = config.dockerRuntime === undefined ? (config.releaseProfile ? createTemporaryReleaseClient({ port: ctx.webServer.port, team: true, profile: config.releaseProfile, source: createLocalSourceBundle(), getUser: async () => (await service.route('status')).user }) : null) : config.dockerRuntime;
+  if (dockerRuntime !== null && (!dockerRuntime || ['check','promotion','start','status','accept','reconcile'].some(key => typeof dockerRuntime[key] !== 'function'))) throw new TypeError('Trusted Docker runtime capability required.');
+  if (config.dockerRuntime === undefined && dockerRuntime) ctx.effect(() => () => dockerRuntime.close());
+  const dockerPreview = createDockerPreview({ inspect: service.inspect, getUser: async () => (await service.route('status')).user });
   const updater = createRemoteUpdater();
   ctx.effect(() => () => updater.close());
   const notifier = createConflictNotifier(ctx, service);
   const environment = createEnvironmentSetup(ctx);
+  const remoteDeploy = createRemoteDeploy(ctx);
+  const nativeDev = createNativeDevDeploy({ inspect: service.inspect, port: ctx.webServer.port, redact });
+  ctx.effect(() => () => nativeDev.close());
   ctx.effect(() => () => service.close());
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: '/simple-github', async handler(req, res) {
     res.setHeader('Cache-Control', 'no-store');
@@ -29,12 +42,27 @@ export function apply(ctx) {
       if (!url.pathname.startsWith(`${API_BASE}/`)) throw new ApiError('Not found', 404);
       const name = url.pathname.slice(API_BASE.length + 1);
       const get = name === 'status' || (name === 'login' && url.searchParams.has('id'));
-      const routes = ['environment-inspect','environment-notify','update-check','update-install','choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
+      const routes = ['docker-overview','docker-status','docker-accept','docker-reconcile','docker-start','docker-plan','docker-promote','docker-restore','docker-preview','error-notify','remote-dev-check','remote-dev-start','remote-dev-status','remote-deploy-notify','environment-inspect','environment-notify','update-check','update-install','choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
       if (!routes.includes(name)) throw new ApiError('Not found', 404);
       if (req.method !== (get ? 'GET' : 'POST')) throw new ApiError(get ? 'GET required' : 'POST required', 405);
       let body = {};
       if (!get) { if (!service.tokenMatches(req.headers['x-simple-git-token'])) throw new ApiError('Missing or invalid CSRF token; refresh status', 403); body = await readJson(req); }
-      reply(200, name === 'environment-inspect' ? await environment.inspect() : name === 'environment-notify' ? await environment.notify(body) : name === 'update-check' ? await updater.check() : name === 'update-install' ? await updater.install(body) : name === 'choose-directory' ? await chooseDirectory() : name === 'notify-conflict' ? await notifier.notify(body) : await service.route(name, body, url.searchParams));
-    } catch (error) { reply(error instanceof ApiError ? error.status : [400,409,503,504].includes(error.status) ? error.status : 400, { ok: false, error: error instanceof ApiError ? error.message : redact(error.message || 'Operation failed').slice(0, 1000) }); }
+      if (['docker-plan','docker-promote','docker-restore','docker-start','docker-overview','docker-status','docker-accept','docker-reconcile'].includes(name) && !dockerRuntime) throw new ApiError('尚未配置受控项目发布参数 releaseProfile；团队发布需管理员一次性配置受控入口，成员无需 sudo', 409);
+      if (dockerRuntime && ['docker-plan','docker-promote','docker-restore','docker-start','docker-overview','docker-status','docker-accept','docker-reconcile'].includes(name)) {
+        if (name === 'docker-status') {
+          if (!body || ![Object.prototype,null].includes(Object.getPrototypeOf(body)) || Object.keys(body).some(key => key !== 'jobId') || (body.jobId !== undefined && (typeof body.jobId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(body.jobId) || /[\s\x00-\x1f\x7f]/.test(body.jobId)))) throw new ApiError('只允许 jobId 查询',400);
+        }
+        if (name === 'docker-overview') {
+          if (!body || ![Object.prototype,null].includes(Object.getPrototypeOf(body)) || Object.keys(body).length) throw new ApiError('部署概览不接受参数',400);
+          if (typeof dockerRuntime.overview !== 'function') throw new ApiError('当前发布入口尚不支持部署概览，请更新受控入口',409);
+        }
+        if (name === 'docker-restore' && typeof dockerRuntime.restore !== 'function') throw new ApiError('当前发布入口不支持恢复，请更新受控入口',409);
+        const method = {'docker-overview':'overview','docker-plan':'check','docker-promote':'promotion','docker-restore':'restore','docker-start':'start','docker-status':'status','docker-accept':'accept','docker-reconcile':'reconcile'}[name];
+        reply(200,await dockerRuntime[method](name === 'docker-status' ? body.jobId : body));return;
+      }
+      if (['remote-dev-check','remote-dev-start'].includes(name)) throw new ApiError('旧本地构建上传链路已停用：远程部署仅允许 GitHub 远程 dev 提交', 409);
+      if (name === 'error-notify') throw new ApiError('报错自动发送功能已移除，请在面板查看错误详情', 410);
+      reply(200, name === 'docker-preview' ? await dockerPreview(body) : name === 'remote-dev-check' ? await nativeDev.check(body) : name === 'remote-dev-start' ? await nativeDev.start(body) : name === 'remote-dev-status' ? await nativeDev.status(body) : name === 'remote-deploy-notify' ? await remoteDeploy.notify(body) : name === 'environment-inspect' ? await environment.inspect() : name === 'environment-notify' ? await environment.notify(body) : name === 'update-check' ? await updater.check() : name === 'update-install' ? await updater.install(body) : name === 'choose-directory' ? await chooseDirectory() : name === 'notify-conflict' ? await notifier.notify(body) : await service.route(name, body, url.searchParams));
+    } catch (error) { reply(error instanceof ApiError ? error.status : [400,403,404,409,429,503,504].includes(error.status) ? error.status : 400, { ok: false, error: error instanceof ApiError ? error.message : redact(error.message || 'Operation failed').slice(0, 1000) }); }
   } }));
 }

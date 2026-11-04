@@ -497,6 +497,12 @@ export function createService({ ghPath, env = process.env, command = runCommand,
     if (name.startsWith('deploy-')) return deployment.route(name, body);
     switch (name) {
       case 'status': { let available = true; try { await executable(); } catch { available = false; } return { ok: true, user: available ? await user() : null, ghAvailable: available, csrfToken, defaultDirectory, environment:platformInfo(platform) }; }
+      case 'docker-remote-source': {
+        if (!body || typeof body !== 'object' || Array.isArray(body) || Reflect.ownKeys(body).length) throw new ApiError('Remote source accepts no local directory or revision');
+        const data = JSON.parse((await gh(['api','repos/ssal-team/XiAN-OA/git/ref/heads/dev','--hostname','github.com'])).stdout);
+        if (data.ref !== 'refs/heads/dev' || data.object?.type !== 'commit' || !/^[a-f0-9]{40}$/.test(data.object?.sha || '')) throw new ApiError('Invalid remote dev commit');
+        return {repository:'ssal-team/XiAN-OA',branch:'dev',head:data.object.sha,sourceOrigin:'github-remote-dev'};
+      }
       case 'login': {
         const id = query.get('id');
         if (id) { const item = logins.get(id); if (!item) throw new ApiError('Unknown or expired login', 404); return { ok: true, ...item }; }
