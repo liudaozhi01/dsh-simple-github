@@ -31,6 +31,16 @@ OVERRIDE_HEADER = '# xian-oa-release managed images only\n'
 class Refused(Exception):
     pass
 
+def failure_details(text):
+    """Only publish recognized structural errors, never arbitrary log lines/SQL."""
+    patterns = (
+        r"Referencing column '[A-Za-z0-9_]+' and referenced column '[A-Za-z0-9_]+' in foreign key constraint '[A-Za-z0-9_]+' are incompatible\.",
+        r'dependency failed to start: container [A-Za-z0-9_.-]+ is unhealthy',
+        r'Bind for (?:[0-9.]+:)?[0-9]+ failed: port is already allocated',
+    )
+    return list(dict.fromkeys(match.group(0) for pattern in patterns for match in re.finditer(pattern, text)))[:4]
+
+
 def require(ok, message):
     if not ok:
         raise Refused(message)
@@ -310,6 +320,9 @@ class Release:
                         log.write(output.read(1024 * 1024))
                 finally:
                     os.close(fd)
+            if result.returncode != 0:
+                output.seek(0)
+                self.last_failure_details = failure_details(output.read(1024 * 1024).decode('utf-8', errors='replace'))
             require(result.returncode == 0, 'Server command failed (output withheld; no business secrets exposed)')
             size = output.tell()
             require(size <= 8 * 1024 * 1024, 'Server command output too large')
@@ -378,6 +391,25 @@ class Release:
             result[service] = {'containerId': row['Id'], 'imageId': row['Image'], 'healthy': row.get('State', {}).get('Running') is True and row.get('State', {}).get('Health', {}).get('Status') == 'healthy'}
         return result
 
+    def deployment_failure_details(self, job):
+        details = list(getattr(self, 'last_failure_details', []))
+        # Read only the exact containers/images attempted by this job, including
+        # stopped ones. Never return raw logs, configuration or SQL statements.
+        for service in ('api', 'web'):
+            try:
+                ids = self.compose(job['environment'], ['ps', '-a', '-q', service], override=True).split()
+                require(len(ids) == 1 and re.fullmatch(r'[a-f0-9]{64}', ids[0]), 'Invalid diagnostic container')
+                rows = loads(self.run([self.config['docker'], 'inspect', ids[0]], timeout=10))
+                row = rows[0]
+                labels = row.get('Config', {}).get('Labels', {})
+                require(row['Image'] == job['images'][service] and labels.get('com.docker.compose.project') == self.projects[job['environment']] and labels.get('com.docker.compose.service') == service, 'Diagnostic container identity mismatch')
+                logs = self.run([self.config['docker'], 'logs', '--tail', '200', '--since', str(job['createdAt']), ids[0]], timeout=10)
+                details.extend(failure_details(logs))
+            except Exception:
+                # Diagnostics must not replace the original failure or replay up.
+                continue
+        return list(dict.fromkeys(details))[:4]
+
     def check(self, body):
         obj(body, ['head'], ['head'])
         require(type(body['head']) is str and SHA.fullmatch(body['head']), 'Full GitHub commit SHA required')
@@ -388,8 +420,28 @@ class Release:
     def plan(self, key, environment, head, images=None, release=None):
         override = self.active_override(environment)
         config = self.config_snapshot(environment, override=override)
-        observed = self.observe(environment)
-        require(all(x['healthy'] for x in observed.values()), 'Existing services must be healthy')
+        try:
+            observed = self.observe(environment)
+            require(all(x['healthy'] for x in observed.values()), 'Existing services must be healthy')
+        except Refused as error:
+            if str(error) not in ('Expected one existing container per service', 'Existing services must be healthy'):
+                raise
+            details = []
+            for service in ('api', 'web'):
+                try:
+                    ids = self.compose(environment, ['ps', '-a', '-q', service], override=override).split()
+                    require(len(ids) == 1 and re.fullmatch(r'[a-f0-9]{64}', ids[0]), 'Invalid diagnostic container')
+                    rows = loads(self.run([self.config['docker'], 'inspect', ids[0]], timeout=10))
+                    row = rows[0]
+                    labels = row.get('Config', {}).get('Labels', {})
+                    require(labels.get('com.docker.compose.project') == self.projects[environment] and labels.get('com.docker.compose.service') == service and row['Config']['Image'] == config['services'][service]['image'], 'Diagnostic container identity mismatch')
+                    logs = self.run([self.config['docker'], 'logs', '--tail', '200', ids[0]], timeout=10)
+                    details.extend(failure_details(logs))
+                except Exception:
+                    continue
+            if details:
+                raise Refused('Preflight service failure: ' + '；'.join(dict.fromkeys(details)))
+            raise
         value = {'planId': key, 'environment': environment, 'remote': {'repository': self.profile['repository'], 'branch': self.profile['branch'], 'head': head}, 'expiresAt': int(time.time()) + 300, 'actor': self.user, 'fingerprint': digest(config), 'previous': observed, 'images': images, 'sourceReleaseId': release}
         self.put('plan', key, value)
         return {k: value[k] for k in ('planId', 'environment', 'remote', 'expiresAt')}
@@ -520,6 +572,7 @@ class Release:
             job = self.get('job', key)
             require(job['status'] == 'pending', 'Job already claimed')
             plan = self.get('plan', job['planId'])
+            self.last_failure_details = []
             try:
                 job.update(status='running', stage='preflight', workerPid=os.getpid())
                 self.put('job', key, job)
@@ -570,8 +623,9 @@ class Release:
                 job.update(status='ready', stage='awaiting-acceptance', observed=observed)
                 self.put('job', key, job)
             except Exception:
-                # Do not leak command output, config, credentials or source content.
-                job.update(status='uncertain' if job.get('stage') in ('applying', 'health') else 'failed', error='Server operation failed; inspect read-only reconcile and server diagnostics', finishedAt=int(time.time()))
+                # Persist only allowlisted structural diagnostics, not raw output.
+                details = self.deployment_failure_details(job) if job.get('stage') in ('applying', 'health') else list(getattr(self, 'last_failure_details', []))
+                job.update(status='uncertain' if job.get('stage') in ('applying', 'health') else 'failed', errorDetails=details, error='Server operation failed; inspect read-only reconcile and server diagnostics', finishedAt=int(time.time()))
                 self.put('job', key, job)
 
     @staticmethod
@@ -622,8 +676,12 @@ class Release:
         result['elapsedSeconds'] = max(0, end - created)
         if job['status'] in ('failed', 'uncertain'):
             code = 'DELIVERY_UNCERTAIN' if job['status'] == 'uncertain' else 'BUILD_FAILED' if job.get('stage') == 'building' else 'RELEASE_FAILED'
-            summaries = {'DELIVERY_UNCERTAIN': '部署结果待核对，请查询只读核对结果；不要重复发布', 'BUILD_FAILED': '服务器构建失败；管理员可查看受控诊断文件', 'RELEASE_FAILED': '服务器发布步骤失败；管理员可查看受控诊断文件'}
-            result.update(errorCode=code, errorSummary=summaries[code], error=summaries[code])
+            details = failure_details('\n'.join(x for x in job.get('errorDetails', []) if isinstance(x, str)))
+            stages = {'building': '服务器编译', 'applying': '更新服务', 'health': '健康检查'}
+            summary = stages.get(job.get('stage'), '服务器执行') + '失败。' + ('实际错误：' + '；'.join(details) + '。' if details else '未提取到可安全展示的具体错误，请按任务编号查看受控日志。')
+            if job['status'] == 'uncertain':
+                summary += '服务器状态可能已改变，请只读核对；不要重复发布。'
+            result.update(errorCode=code, errorSummary=summary, errorDetails=details, error=summary)
         return result
 
     def reconcile(self, body):

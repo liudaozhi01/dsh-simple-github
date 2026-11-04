@@ -71,6 +71,24 @@ test('production rejects oversized script and wrong SSH identity without remote 
   const wrong = createTemporaryReleaseTransport({ port: 1, script: 'pass', bridge: async () => ({ hosts: [{ ...profile().target, host: 'wrong', auth: 'key', proxyJump: [] }] }) });
   await assert.rejects(wrong.request({ profile: profile(), action: 'status', body: {} }), /身份/);
 });
+test('known preflight refusals survive transport and client without leaking stderr', async () => {
+  for (const [reason, expected] of [['Existing services must be healthy', /服务不健康/], ['Expected one existing container per service', /缺失或未运行/], ["Preflight service failure: Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible.", /外键字段类型不兼容.*rbac_account_ibfk_1/]]) {
+    for (const jsonResponse of [false, true]) {
+    const p = profile();
+    const transport = createTemporaryReleaseTransport({ port: 1, script: 'pass', bridge: async path => {
+      if (path === '/api/dsh-ssh/hosts') return { hosts: [{ ...p.target, auth: 'key', proxyJump: [] }] };
+      return { result: { exitCode: 1, stdout: jsonResponse ? JSON.stringify({ error: reason }) : '', stderr: jsonResponse ? '' : 'password=secret\nrelease.Refused: ' + reason } };
+    } });
+    const f = fixture('刘道志', { transport });
+    await assert.rejects(f.client.check(), error => expected.test(error.message) && !error.message.includes('secret'));
+    transport.close();
+    }
+  }
+});
+test('unknown transport failures remain private and uncertain', async () => {
+  const f = fixture('刘道志', { transport: async () => { throw Error('password=secret'); } });
+  await assert.rejects(f.client.check(), error => /未明确响应/.test(error.message) && !error.message.includes('secret'));
+});
 test('generated bundle bootstrap compiles and verifies bytes before root invocation', async () => {
   const commands = [], p = profile();
   const transport = createTemporaryReleaseTransport({ port: 1, script: 'pass', bridge: async (path, { json, file }) => {

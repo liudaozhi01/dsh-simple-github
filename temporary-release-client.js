@@ -8,6 +8,19 @@ import { validateReleaseProfile } from './release-profile.js';
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/;
 const SHA = /^[a-f0-9]{40}$(?![\s\S])/;
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
+const releaseRefusals = new Map([
+  ['Existing services must be healthy', '发布前检查失败：当前环境服务不健康，请先排查并恢复服务；本次发布尚未启动。'],
+  ['Expected one existing container per service', '发布前检查失败：当前环境存在缺失或未运行的服务容器；本次发布尚未启动。'],
+  ['Another release operation is active', '服务器已有发布操作正在执行，请先查询状态，不要重复发布。'],
+]);
+function knownReleaseRefusal(text) {
+  if (typeof text !== 'string' || text.length > 65536) return;
+  const foreignKey = text.match(/Referencing column '([A-Za-z0-9_]+)' and referenced column '([A-Za-z0-9_]+)' in foreign key constraint '([A-Za-z0-9_]+)' are incompatible\./);
+  if (foreignKey) return `发布前检查失败：后端启动失败，外键字段类型不兼容（引用字段 ${foreignKey[1]}，被引用字段 ${foreignKey[2]}，约束 ${foreignKey[3]}）。实际错误：${foreignKey[0]} 请先修复数据库结构与代码的兼容问题；本次发布尚未启动。`;
+  for (const [source, message] of releaseRefusals) {
+    if (text.split(/\r?\n/).some(line => line === source || line.endsWith(': ' + source) || line === message)) return message;
+  }
+}
 function object(value, keys) {
   if (!value || ![Object.prototype, null].includes(Object.getPrototypeOf(value)) || Reflect.ownKeys(value).some(k => !keys.includes(k) || !Object.hasOwn(Object.getOwnPropertyDescriptor(value, k), 'value'))) throw fail('发布请求字段无效');
   return { ...value };
@@ -69,6 +82,12 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
   async function exec(profile, command) {
     const data = await bridge('/api/dsh-ssh/exec', { json: { alias: profile.target.alias, command, timeoutMs: 180000 } });
     const result = data?.result;
+    if (result && result.exitCode !== 0 && !result.timedOut && !result.truncated) {
+      let responseReason;
+      try { responseReason = knownReleaseRefusal(JSON.parse(result.stdout)?.error); } catch { /* Non-JSON SSH failures stay private. */ }
+      const reason = responseReason || knownReleaseRefusal(result.stderr) || knownReleaseRefusal(result.stdout);
+      if (reason) throw fail(reason, 503);
+    }
     if (!result || result.exitCode !== 0 || result.timedOut || result.truncated || typeof result.stdout !== 'string') throw fail('远程操作未明确响应；请查询状态，不要重复提交发布', 503);
     return result.stdout;
   }
@@ -146,7 +165,7 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
     ensure();
     let response;
     try { response = await run({ profile, action, body: structuredClone(body), ...(bundle ? { bundle } : {}) }); }
-    catch { throw fail('临时发布入口未明确响应；请查询状态，不要重复提交发布', 503); }
+    catch (error) { throw fail(knownReleaseRefusal(error?.message) || '临时发布入口未明确响应；请查询状态，不要重复提交发布', 503); }
     ensure();
     if (!response || ![Object.prototype, null].includes(Object.getPrototypeOf(response)) || response.ok === false || Object.hasOwn(response, 'error')) throw fail('临时发布入口拒绝或未明确响应；请查询状态', 503);
     return structuredClone(response);

@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-simple-github",
-  "version": "0.15.6",
+  "version": "0.15.9",
   "description": "简洁 GitHub 团队协作：网页登录、提交推送、PR 合并",
   "type": "module",
   "exports": {".": "./index.js", "./client": "./client.js"},

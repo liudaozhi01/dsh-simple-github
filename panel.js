@@ -223,7 +223,7 @@ export function mount(root,options={}){
     if(typeof dockerJob.elapsedSeconds==='number')status.append(el('p','耗时 '+Math.round(dockerJob.elapsedSeconds)+' 秒','sg-muted'));
     if(!remoteProblem&&['failed','uncertain'].includes(dockerJob.status))status.append(el('p',dockerJob.errorSummary||'服务器执行未确认成功。请复制排查信息，联系管理员按任务编号查看受控日志。','sg-warning'));
     const detail=disclosure('release-diagnostics');detail.append(el('summary','排查信息'));
-    const info=JSON.stringify({jobId:dockerJob.jobId,environment:dockerJob.environment,head:dockerJob.head,status:dockerJob.status,stage:dockerJob.stage,errorCode:dockerJob.errorCode,errorSummary:dockerJob.errorSummary},null,2);
+    const info=JSON.stringify({jobId:dockerJob.jobId,environment:dockerJob.environment,head:dockerJob.head,status:dockerJob.status,stage:dockerJob.stage,errorCode:dockerJob.errorCode,errorSummary:dockerJob.errorSummary,errorDetails:dockerJob.errorDetails},null,2);
     detail.append(el('pre',info),button('复制排查信息',async()=>{if(!globalThis.navigator?.clipboard?.writeText)throw new Error('剪贴板不可用，请展开排查信息手动复制。');await navigator.clipboard.writeText(info);message('排查信息已复制。');}));status.append(detail);
    }else if(!remotePhase)status.append(el('p',remoteLoaded?'暂无部署记录':'打开后自动读取服务器部署状态','sg-muted'));
    if(remoteProblem||remoteUncertain||dockerJob?.status==='uncertain')status.append(button('重新核对状态',async()=>{if(!remoteUncertain&&dockerJob?.jobId)rememberRemote(await api('/docker-reconcile',{jobId:dockerJob.jobId}));remoteFailures=0;await refreshRemote();}));

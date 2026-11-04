@@ -85,6 +85,45 @@ class Tests(unittest.TestCase):
    m.Release.run(self.r,[sys.executable,'-c','print("diagnostic-only"); raise SystemExit(1)'])
   log=self.r.state/'last-command-failure.log'
   self.assertEqual(log.read_text(),'diagnostic-only\n');self.assertEqual(log.stat().st_mode & 0o777,0o600)
+ def test_preflight_returns_root_cause_without_creating_job(self):
+  message="Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible."
+  def run(argv,**kwargs):
+   if argv[1]=='inspect':return json.dumps([{'Config':{'Image':OLD['api'],'Labels':{'com.docker.compose.project':self.r.projects['dev'],'com.docker.compose.service':'api'}}}])
+   return 'password=secret\n'+message
+  with patch.object(self.r,'observe',side_effect=m.Refused('Expected one existing container per service')),patch.object(self.r,'compose',return_value='a'*64),patch.object(self.r,'run',side_effect=run):
+   with self.assertRaisesRegex(m.Refused,'Preflight service failure') as caught:self.plan()
+  self.assertIn(message,str(caught.exception));self.assertNotIn('secret',str(caught.exception));self.assertEqual(list(self.r.state.glob('job-*')),[])
+ def test_safe_structural_diagnostics(self):
+  message="Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible."
+  raw='password=secret SELECT confidential FROM payroll\nCaused by: java.sql.SQLException: '+message+'\nAuthorization: Bearer hidden'
+  self.assertEqual(m.failure_details(raw),[message])
+  public=m.Release.public_job({'status':'uncertain','stage':'applying','createdAt':1,'errorDetails':[raw]})
+  self.assertEqual(public['errorDetails'],[message]);self.assertIn(message,public['errorSummary']);self.assertIn('不要重复发布',public['errorSummary'])
+  self.assertNotIn('secret',json.dumps(public));self.assertNotIn('payroll',json.dumps(public))
+ def test_diagnostics_validate_container_identity(self):
+  message="Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible."
+  self.r.last_failure_details=['dependency failed to start: container example-dev-api-1 is unhealthy']
+  job={'environment':'dev','images':IM,'createdAt':123};calls=[]
+  def compose(e,args,**kwargs):
+   self.assertEqual(args[:3],['ps','-a','-q']);return 'a'*64
+  def run(argv,**kwargs):
+   calls.append(argv)
+   if argv[1]=='inspect':return json.dumps([{'Image':IM['api'],'Config':{'Labels':{'com.docker.compose.project':self.r.projects['dev'],'com.docker.compose.service':'api'}}}])
+   return 'password=secret\n'+message
+  with patch.object(self.r,'compose',side_effect=compose),patch.object(self.r,'run',side_effect=run):
+   details=self.r.deployment_failure_details(job)
+  self.assertIn(message,details);self.assertEqual(sum(c[1]=='logs' for c in calls),1)
+  self.assertTrue(all(c[1] in ('inspect','logs') for c in calls));self.assertNotIn('secret',json.dumps(details))
+ def test_apply_persists_details_and_diagnostic_failure_is_safe(self):
+  self.r.fail='up';message='dependency failed to start: container example-dev-api-1 is unhealthy'
+  with patch.object(self.r,'deployment_failure_details',return_value=[message]):
+   job=self.work(self.start(self.plan()))
+  self.assertEqual(job['status'],'uncertain');self.assertEqual(job['errorDetails'],[message]);self.assertIn(message,m.Release.public_job(job)['errorSummary'])
+  with patch.object(self.r,'compose',side_effect=RuntimeError('password=secret')):
+   self.assertEqual(self.r.deployment_failure_details(job),[])
+ def test_legacy_job_safe_fallback(self):
+  public=m.Release.public_job({'status':'uncertain','stage':'applying','createdAt':1,'error':'password=secret'})
+  self.assertIn('未提取到',public['errorSummary']);self.assertNotIn('secret',json.dumps(public))
  def test_broker_helper_private_stage(self):
   from types import SimpleNamespace
   self.r.broker=True;self.r.env['DSH_RELEASE_MYSQL_IMAGE']='mysql@sha256:'+'a'*64
@@ -211,5 +250,5 @@ test('temporary release isolated Python state machine, archive and lifecycle fix
   const result = spawnSync('python3', ['-I', '-B', '-c', fixture, source], { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.match(result.stderr, /Ran 28 tests/);
+  assert.match(result.stderr, /Ran 33 tests/);
 });
