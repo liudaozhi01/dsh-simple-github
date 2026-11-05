@@ -110,7 +110,12 @@ export function validateMerge(pr, { number, repository, baseBranch, expectedHead
   const url = new URL(pr.url); if (url.origin !== 'https://github.com' || url.pathname.toLowerCase() !== `/${repository}/pull/${number}`.toLowerCase()) throw new ApiError('PR repository mismatch');
   if (!Array.isArray(pr.statusCheckRollup) || pr.statusCheckRollup.some(c => c.__typename === 'StatusContext' ? !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(c.state) : c.status !== 'COMPLETED' || !['SUCCESS', 'NEUTRAL', 'SKIPPED'].includes(c.conclusion))) throw new ApiError('All checks must complete successfully (or neutral/skipped)');
 }
-export function createService({ ghPath, env = process.env, command = runCommand, defaultDirectory = process.cwd(), deploymentFactory = createLocalDeploy, platform = process.platform } = {}) {
+export function createService({ ghPath, env = process.env, command = runCommand, defaultDirectory = process.cwd(), deploymentFactory = createLocalDeploy, platform = process.platform, repository = FIXED_REPOSITORY, branch = 'dev', cloneMode = 'single', cloneBranch = branch } = {}) {
+  repository = repositorySlug(repository);
+  if (typeof branch !== 'string' || !branch || branch.startsWith('-') || branch.startsWith('refs/') || branch === '@' || branch.length > 240 || /[\x00-\x20\x7f~^:?*\[\\]/.test(branch) || branch.includes('..') || branch.includes('@{') || branch.split('/').some(part => !part || part.startsWith('.') || part.endsWith('.') || part.endsWith('.lock'))) throw new ApiError('Invalid configured branch');
+  if (!['all','single'].includes(cloneMode)) throw new ApiError('Invalid configured clone mode');
+  if (typeof cloneBranch !== 'string' || !cloneBranch || cloneBranch.startsWith('-') || cloneBranch.startsWith('refs/') || cloneBranch === '@' || cloneBranch.length > 240 || /[\x00-\x20\x7f~^:?*\[\\]/.test(cloneBranch) || cloneBranch.includes('..') || cloneBranch.includes('@{') || cloneBranch.split('/').some(part => !part || part.startsWith('.') || part.endsWith('.') || part.endsWith('.lock'))) throw new ApiError('Invalid configured clone branch');
+  const localRef = `refs/heads/${branch}`, trackingRef = `refs/remotes/origin/${branch}`, fetchRefspec = `+${localRef}:${trackingRef}`;
   const csrfToken = randomBytes(32).toString('hex'), locks = new Set(), logins = new Map(), clones = new Map(), controllers = new Set();
   const conflictReports = new Map();
   let ghPromise, hooksPromise;
@@ -129,7 +134,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
     if (!isWithin(directory, top) || !isWithin(top, directory)) throw new ApiError('Select the exact repository root, not a nested directory');
     const fetchUrls=(await out(directory,['remote','get-url','--all','origin'])).split('\n');
     const pushUrls=(await out(directory,['remote','get-url','--push','--all','origin'])).split('\n');
-    if(fetchUrls.length!==1||pushUrls.length!==1||[...fetchUrls,...pushUrls].some(url=>githubRemote(url).toLowerCase()!==FIXED_REPOSITORY.toLowerCase())) throw new ApiError('此插件仅支持指定团队项目，请选择正确的项目目录');
+    if(fetchUrls.length!==1||pushUrls.length!==1||[...fetchUrls,...pushUrls].some(url=>githubRemote(url).toLowerCase()!==repository.toLowerCase())) throw new ApiError('此插件仅支持指定团队项目，请选择正确的项目目录');
     return directory;
   }
   async function fingerprint(directory, head, changes) {
@@ -211,7 +216,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
     if (await out(directory, ['ls-files','--unmerged'])) throw new ApiError('Resolve merge conflicts first');
     return merging;
   }
-  function requireDev(info) { if (info.branch !== 'dev') throw new ApiError('请先切换到 dev；只允许提交、同步或推送共享 dev 分支'); }
+  function requireDev(info) { if (info.branch !== branch) throw new ApiError(`请先切换到 ${branch}；只允许提交、同步或推送共享 ${branch} 分支`); }
   function snapshot(info) { return { expectedBranch:info.branch, expectedRepository:info.repository, expectedBaseBranch:info.baseBranch, expectedHead:info.head, expectedFingerprint:info.fingerprint }; }
   async function getConflictReport({ directory, conflictId } = {}) {
     text(conflictId, 'conflict ID', 128);
@@ -413,8 +418,8 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         await rename(replacement,indexPath); replacedIndex = true;
       }
       finally { await rm(replacement,{force:true}); }
-      if (await out(directory,['symbolic-ref','HEAD']) !== 'refs/heads/dev') throw new ApiError('Branch changed during sync',409);
-      await safeGit(directory, ['update-ref','refs/heads/dev',baseline.head,originalHead]); updatedHead = true;
+      if (await out(directory,['symbolic-ref','HEAD']) !== localRef) throw new ApiError('Branch changed during sync',409);
+      await safeGit(directory, ['update-ref',localRef,baseline.head,originalHead]); updatedHead = true;
       return { ok:true, conflict:false };
     } catch (error) {
       const failures = [];
@@ -494,9 +499,10 @@ export function createService({ ghPath, env = process.env, command = runCommand,
   }
   const deployment = deploymentFactory({ inspect, redact });
   async function route(name, body = {}, query = new URLSearchParams()) {
+    if ((name.startsWith('deploy-') || name === 'docker-remote-source') && (repository.toLowerCase() !== FIXED_REPOSITORY.toLowerCase() || branch !== 'dev')) throw new ApiError('当前项目未配置发布适配，禁止使用 OA 专属发布入口', 409);
     if (name.startsWith('deploy-')) return deployment.route(name, body);
     switch (name) {
-      case 'status': { let available = true; try { await executable(); } catch { available = false; } return { ok: true, user: available ? await user() : null, ghAvailable: available, csrfToken, defaultDirectory, environment:platformInfo(platform) }; }
+      case 'status': { let available = true; try { await executable(); } catch { available = false; } return { ok: true, user: available ? await user() : null, ghAvailable: available, csrfToken, defaultDirectory, project:{repository,branch}, environment:platformInfo(platform) }; }
       case 'docker-remote-source': {
         if (!body || typeof body !== 'object' || Array.isArray(body) || Reflect.ownKeys(body).length) throw new ApiError('Remote source accepts no local directory or revision');
         const data = JSON.parse((await gh(['api','repos/ssal-team/XiAN-OA/git/ref/heads/dev','--hostname','github.com'])).stdout);
@@ -538,7 +544,6 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         return { ...item };
       }
       case 'clone': {
-        const repository = FIXED_REPOSITORY;
         if(body.repository!==undefined&&normalizeCloneRepository(body.repository).toLowerCase()!==repository.toLowerCase()) throw new ApiError('此插件只能克隆指定团队项目');
         if (typeof body.parentDirectory !== 'string' || !body.parentDirectory.trim()) throw new ApiError('请先选择克隆保存目录');
         const parent = text(body.parentDirectory.trim(), '保存目录');
@@ -554,7 +559,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         for (const [key,value] of clones) { if (clones.size <= 20) break; if (value.state !== 'running') clones.delete(key); }
         void (async()=>{
           try {
-            await gh(['repo','clone',`https://github.com/${repository}.git`,directory,'--','--branch','dev','--single-branch','--progress','-c','credential.helper=','-c',`credential.helper=${await credentialHelper()}`], {
+            await gh(['repo','clone',`https://github.com/${repository}.git`,directory,'--','--branch',cloneMode === 'single' ? cloneBranch : branch,...(cloneMode === 'single' ? ['--single-branch'] : ['--no-single-branch']),'--progress','-c','credential.helper=','-c',`credential.helper=${await credentialHelper()}`], {
               cwd:parentDirectory, timeout:600000, signal:controller.signal, truncate:true,
               onOutput(chunk) {
                 item.log = redact(item.log + chunk.replace(/\x1b\[[0-9;]*m/g,'')).slice(-12000);
@@ -577,9 +582,9 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         return { diff: `=== Staged changes ===\n${staged.stdout}\n=== Unstaged changes ===\n${unstaged.stdout}`.replace(/\0/g, '\uFFFD'), truncated: staged.truncated || unstaged.truncated, untrackedNotice: 'Untracked files are listed in the change list, not included in this diff; submitting stages all files including untracked files.' };
       }
       case 'branch': case 'switch-main': case 'pull': case 'pr-create': case 'pr-merge':
-        throw new ApiError('Legacy mutation disabled; use shared dev workflow', 403);
+        throw new ApiError('Legacy mutation disabled; use configured shared branch workflow', 403);
       case 'task-start': case 'task-submit': case 'task-switch': case 'task-list': case 'task-status':
-        throw new ApiError('Task workflow disabled; use shared dev workflow', 403);
+        throw new ApiError('Task workflow disabled; use configured shared branch workflow', 403);
       case 'commit-local': case 'push': return locked(body.directory, async directory => {
         let current = await expectedState(directory, body);
         requireDev(current);
@@ -612,9 +617,9 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         if (name === 'commit-local') return { ok:true };
         if (current.contentFingerprint !== beforeCommit.contentFingerprint || (stagedTree && await out(directory, ['rev-parse','HEAD^{tree}']) !== stagedTree)) throw new ApiError('Committed content differs from the previewed source; refresh the preview before pushing', 409);
         const committed = snapshot(current), localHead = current.head;
-        await networkGit(directory, ['fetch','origin','+refs/heads/dev:refs/remotes/origin/dev']);
+        await networkGit(directory, ['fetch','origin',fetchRefspec]);
         current = await expectedState(directory, committed); requireDev(current); await noOperation(directory);
-        const remoteHead = await out(directory, ['rev-parse','--verify','refs/remotes/origin/dev^{commit}']);
+        const remoteHead = await out(directory, ['rev-parse','--verify',`${trackingRef}^{commit}`]);
         const merged = await isolatedMerge(directory, localHead, remoteHead);
         if (merged.conflict) return merged;
         current = await expectedState(directory, committed); requireDev(current); await noOperation(directory);
@@ -627,25 +632,32 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         }
         // Revalidate the clean post-merge snapshot before the normal, explicit push.
         await expectedState(directory, committed); await noOperation(directory);
-        try { await networkGit(directory, ['push','--set-upstream','origin','refs/heads/dev:refs/heads/dev']); }
-        catch (error) { throw new ApiError('推送失败：本地提交已保留。请刷新并同步 dev、解决冲突后重试；不要强推。详情：' + redact(error.message)); }
+        try { await networkGit(directory, ['push','--set-upstream','origin',`${localRef}:${localRef}`]); }
+        catch (error) { throw new ApiError(`推送失败：本地提交已保留。请刷新并同步 ${branch}、解决冲突后重试；不要强推。详情：` + redact(error.message)); }
         return { ok:true };
       });
       case 'switch-dev': return locked(body.directory, async directory => {
         let current = await expectedState(directory, body);
-        if (!current.isClean || !current.branch) throw new ApiError('请先提交或妥善保存本地修改；切换 dev 需要 clean, attached worktree');
+        if (!current.isClean || !current.branch) throw new ApiError(`请先提交或妥善保存本地修改；切换 ${branch} 需要 clean, attached worktree`);
         await noOperation(directory); await remoteContext(directory);
         await expectedState(directory, body); await noOperation(directory);
-        await networkGit(directory, ['fetch','origin','+refs/heads/dev:refs/remotes/origin/dev']);
+        await networkGit(directory, ['fetch','origin',fetchRefspec]);
         current = await expectedState(directory, body);
         if (!current.isClean || !current.branch) throw new ApiError('A clean, attached worktree is required');
         await noOperation(directory);
         let local = true;
-        try { await git(directory, ['show-ref','--verify','--quiet','refs/heads/dev']); } catch { local = false; }
-        if (local) await git(directory, ['switch','--no-guess','--no-overwrite-ignore','dev']);
+        try { await git(directory, ['show-ref','--verify','--quiet',localRef]); } catch { local = false; }
+        if (local) await git(directory, ['switch','--no-guess','--no-overwrite-ignore',branch]);
         else {
-          await git(directory, ['show-ref','--verify','--quiet','refs/remotes/origin/dev']);
-          await git(directory, ['switch','--no-overwrite-ignore','--track','-c','dev','refs/remotes/origin/dev']);
+          await git(directory, ['show-ref','--verify','--quiet',trackingRef]);
+          // --single-branch clones only map their original branch. An explicit
+          // fetch creates the ref but does not teach Git its tracking mapping.
+          const mappings = (await out(directory, ['config','--get-all','remote.origin.fetch'])).split('\n');
+          if (!mappings.includes(fetchRefspec) && !mappings.includes(fetchRefspec.slice(1)) && !mappings.includes('+refs/heads/*:refs/remotes/origin/*') && !mappings.includes('refs/heads/*:refs/remotes/origin/*')) {
+            await git(directory, ['config','--local','--add','remote.origin.fetch',fetchRefspec]);
+          }
+          await expectedState(directory, body); await noOperation(directory);
+          await git(directory, ['switch','--no-overwrite-ignore','--track','-c',branch,trackingRef]);
         }
         return { ok:true };
       });
@@ -657,9 +669,9 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         if (entries.some(entry => entry[0] === 'S' || /^[a-z]/.test(entry))) throw new ApiError('Index skip-worktree/assume-unchanged flags prevent safe sync; clear them before retrying', 409);
         const layers = await captureLayers(directory, current);
         await expectedState(directory, body); await noOperation(directory);
-        await networkGit(directory, ['fetch','origin','+refs/heads/dev:refs/remotes/origin/dev']);
+        await networkGit(directory, ['fetch','origin',fetchRefspec]);
         current = await expectedState(directory, body); requireDev(current); await noOperation(directory);
-        const remoteHead = await out(directory, ['rev-parse','--verify','refs/remotes/origin/dev^{commit}']);
+        const remoteHead = await out(directory, ['rev-parse','--verify',`${trackingRef}^{commit}`]);
         return layeredSync(directory, current, body, remoteHead, layers);
       });
       case 'prs': { const directory = await root(body.directory), repository = githubRemote(await out(directory, ['remote','get-url','origin'])); return { prs: JSON.parse((await gh(['pr','list','--repo',repository,'--state','open','--limit','100','--json','number,title,url,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,headRefOid,statusCheckRollup'])).stdout) }; }

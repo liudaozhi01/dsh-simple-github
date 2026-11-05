@@ -1,5 +1,8 @@
 #!/usr/bin/python3
-"""Root systemd socket-activated release broker; no caller-supplied identity/config."""
+"""Root systemd socket-activated release broker; no caller-supplied identity/config.
+Generic runtime v1 supports only the existing Java 21 + Vite api/web template,
+not arbitrary commands, shell recipes or caller-selected build implementations.
+"""
 import base64
 import concurrent.futures
 import hashlib
@@ -19,6 +22,7 @@ import threading
 import time
 import uuid
 
+PROJECT_ID = None
 CONFIG = Path('/etc/xian-oa-team-release.json')
 ENGINE = Path('/usr/local/libexec/xian-oa-temporary-release.py')
 BUILD = Path('/usr/local/libexec/xian-oa-team-build.py')
@@ -68,6 +72,23 @@ def private(path, directory=False):
     s = path.lstat()
     require(stat.S_ISDIR(s.st_mode) if directory else stat.S_ISREG(s.st_mode), 'Unexpected path type')
     return path
+
+def configure_runtime():
+    """Select a namespace from installed code, never a request or environment."""
+    global PROJECT_ID, CONFIG, ENGINE, BUILD, SOCKET
+    entry = Path(__file__).absolute()
+    directory = entry.parent
+    if entry.name != 'broker.py' and not directory.name.startswith('dsh-release-'):
+        return  # Preserve the original OA defaults without extra arguments.
+    match = re.fullmatch(r'dsh-release-([a-z][a-z0-9-]{0,39})', directory.name)
+    require(entry.name == 'broker.py' and directory.parent == Path('/usr/local/libexec') and match and str(entry) == __file__, 'Invalid installed release path')
+    private(entry)
+    PROJECT_ID = match.group(1)
+    CONFIG = Path('/etc/dsh-release-' + PROJECT_ID + '.json')
+    ENGINE = directory / 'engine.py'
+    BUILD = directory / 'build.py'
+    SOCKET = '/run/dsh-release-' + PROJECT_ID + '.sock'
+
 
 def read_json(path):
     private(path)
@@ -304,6 +325,8 @@ def execute(stage, profile, action, body, user, uid, mysql_image):
     payload = base64.b64encode(json.dumps({'profile': profile, 'action': action, 'body': body}, separators=(',', ':')).encode()).decode()
     require(len(payload) <= 32768, 'Engine request too large')
     env = {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'SUDO_USER': user, 'SUDO_UID': str(uid), 'DSH_RELEASE_BROKER': '1', 'DSH_RELEASE_MYSQL_IMAGE': mysql_image}
+    if PROJECT_ID is not None:
+        env['DSH_RELEASE_PROJECT_ID'] = PROJECT_ID
     process = subprocess.Popen(['/usr/bin/python3', '-I', str(stage / 'script.py'), payload], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, close_fds=True)
     output = bytearray()
     deadline = time.monotonic() + COMMAND_TIMEOUT
@@ -347,6 +370,11 @@ def handle(connection, broker):
         _, uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
         request = receive(connection)
         result = broker.dispatch(request, uid)
+        if PROJECT_ID is not None and 'error' not in result:
+            result = {**result, 'deploymentProjectId': PROJECT_ID,
+                      'deploymentProtocolVersion': 1,
+                      'deploymentRepository': broker.profile['repository'],
+                      'deploymentBranch': broker.profile['branch']}
     except Exception as error:
         result = {'error': str(error) if isinstance(error, Refused) else 'Broker refused request; inspect administrator diagnostics'}
     try:
@@ -361,6 +389,7 @@ def handle(connection, broker):
         connection.close()
 
 def main():
+    configure_runtime()
     config = load_config()
     require(os.environ.get('LISTEN_PID') == str(os.getpid()) and os.environ.get('LISTEN_FDS') == '1', 'One systemd socket required')
     listener = socket.socket(fileno=3)

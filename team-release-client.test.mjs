@@ -42,16 +42,16 @@ test('team client permits another logged-in member; server remains the authoriza
  const p = profile(), calls = [], head = 'c'.repeat(40);
  const client = createTemporaryReleaseClient({ profile: p, team: true, getUser: async () => ({ name: '另一位成员' }), source: {
   resolve: async input => ({ ...input, head }), prepare: async () => ({ path: '/tmp/source', sha256: 'b'.repeat(64), size: 12, cleanup: async () => {} })
- }, transport: async request => { calls.push(request); return request.action === 'check' ? { planId: 'p', environment: 'dev', remote: { repository: p.repository, branch: p.branch, head }, expiresAt: Date.now()/1000 + 300 } : { jobId: 'j', status: 'pending' }; } });
+ }, transport: async request => { calls.push(request); return request.action === 'overview' ? {jobs:[],releaseId:null} : request.action === 'check' ? { planId: 'p', environment: 'dev', remote: { repository: p.repository, branch: p.branch, head }, expiresAt: Date.now()/1000 + 300 } : { jobId: 'j', status: 'pending' }; } });
  await client.check(); await client.start({ planId: 'p', confirmation: true, databaseRiskAccepted: true });
- assert.equal(calls.length, 2);
+ assert.deepEqual(calls.map(x=>x.action), ['overview','check','overview','start']);
 });
 
 for(const environment of ['dev','test'])test('restore transport '+environment+' never prepares or uploads source',async()=>{
  const p=profile(),requests=[];let prepared=0;const transport=createTemporaryReleaseTransport({port:1,team:true,bridge:async(path,args)=>{
   if(path==='/api/dsh-ssh/hosts')return {hosts:[{...p.target,user:'caoyang',auth:'key',proxyJump:[]}]};
   assert.ok(!args.file);const request=JSON.parse(Buffer.from(args.json.command.split("'")[1],'base64').toString());requests.push(request);
-  return {result:{exitCode:0,stdout:JSON.stringify(request.action==='restore'?{planId:'restore-plan',environment,operation:'restore',remote:{repository:p.repository,branch:p.branch,head:'b'.repeat(40)},expiresAt:Date.now()/1000+300}:{jobId:'new-job',status:'pending'})}};
+  return {result:{exitCode:0,stdout:JSON.stringify(request.action==='overview'?{jobs:[],releaseId:null}:request.action==='restore'?{planId:'restore-plan',environment,operation:'restore',remote:{repository:p.repository,branch:p.branch,head:'b'.repeat(40)},expiresAt:Date.now()/1000+300}:{jobId:'new-job',status:'pending'})}};
  }});const client=createTemporaryReleaseClient({profile:p,team:true,transport,getUser:async()=>({name:'成员'}),source:{resolve(){throw Error('must not resolve source');},prepare(){prepared++;throw Error('must not build');}}});
- const plan=await client.restore({environment,jobId:'old-job'});await client.start({planId:plan.planId,confirmation:true,databaseRiskAccepted:true});assert.equal(prepared,0);assert.deepEqual(requests.map(x=>x.action),['restore','start']);assert.ok(!requests[1].body.bundle);client.close();
+ const plan=await client.restore({environment,jobId:'old-job'});await client.start({planId:plan.planId,confirmation:true,databaseRiskAccepted:true});assert.equal(prepared,0);assert.deepEqual(requests.map(x=>x.action),['restore','overview','start']);assert.ok(!requests[2].body.bundle);client.close();
 });

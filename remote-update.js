@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ApiError, findGh, runCommand } from './core.js';
+import { ApiError, findGh, runCommand, normalizeCloneRepository } from './core.js';
 import { normalizeEnv } from './platform.js';
 import { gunzipSync } from 'node:zlib';
 
@@ -50,7 +50,8 @@ export function releaseCandidate(release, currentVersion) {
 
 // Downloads only. The current host has no agent-idle install transaction; do not
 // call installBundle here or mutate the profile while agent tasks may be active.
-export function createRemoteUpdater({ command = runCommand, locateGh = findGh, now = Date.now, currentVersion, tempDirectory = tmpdir() } = {}) {
+export function createRemoteUpdater({ command = runCommand, locateGh = findGh, now = Date.now, currentVersion, tempDirectory = tmpdir(), repository = UPDATE_REPOSITORY } = {}) {
+  repository = normalizeCloneRepository(repository);
   let candidate = null, busy = false, closed = false;
   const abort = new AbortController();
   // Match the panel's gh credential store; inherited tokens must not silently
@@ -68,7 +69,7 @@ export function createRemoteUpdater({ command = runCommand, locateGh = findGh, n
   }
   async function latest() {
     let release;
-    try { release = JSON.parse(await ghApi(`repos/${UPDATE_REPOSITORY}/releases/latest`)); }
+    try { release = JSON.parse(await ghApi(`repos/${repository}/releases/latest`)); }
     catch (error) { throw new ApiError('读取插件 Release 失败：' + error.message); }
     return releaseCandidate(release, currentVersion ?? JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8')).version);
   }
@@ -92,7 +93,7 @@ export function createRemoteUpdater({ command = runCommand, locateGh = findGh, n
       candidate = null; // Consume confirmation even when network or checksum fails.
       const fresh = await latest();
       if (['version','assetId','size','digest','name'].some(key => fresh[key] !== expected[key])) { candidate = null; throw new ApiError('远程版本或安装包已变化，请重新检查更新', 409); }
-      const bytes = await ghApi(`repos/${UPDATE_REPOSITORY}/releases/assets/${expected.assetId}`, true);
+      const bytes = await ghApi(`repos/${repository}/releases/assets/${expected.assetId}`, true);
       if (!Buffer.isBuffer(bytes) || bytes.length !== expected.size || 'sha256:' + createHash('sha256').update(bytes).digest('hex') !== expected.digest) throw new ApiError('安装包 SHA-256 或大小校验失败，未安装');
       validateUpdatePackage(bytes, expected.version);
       if (closed) throw new ApiError('更新服务已关闭', 409);

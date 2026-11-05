@@ -51,6 +51,13 @@ test('expired, changed release, failed check and corrupted bytes never yield ins
   await assert.rejects(updater.install({checkId:c.checkId,confirmed:true}),/重新检查/);
   updater.close();await assert.rejects(updater.check(),/已关闭/);
 });
+test('configured update source is pinned for metadata and verified asset download',async()=>{
+ const directory=await mkdtemp(join(tmpdir(),'update-config-')),calls=[];
+ const updater=createRemoteUpdater({repository:'https://github.com/example/plugin-feed.git',currentVersion:'0.2.0',tempDirectory:directory,locateGh:async()=>'/gh',command:async(cmd,args)=>{calls.push(args);return {stdout:args.includes('Accept: application/octet-stream')?bytes:JSON.stringify(release())};}});
+ try{const candidate=await updater.check();await updater.install({checkId:candidate.checkId,confirmed:true});assert.equal(calls.length,3);assert.ok(calls.every(args=>args.some(arg=>arg.startsWith('repos/example/plugin-feed/releases/'))));}
+ finally{updater.close();await rm(directory,{recursive:true,force:true});}
+ assert.throws(()=>createRemoteUpdater({repository:'https://evil.example/a/b'}));
+});
 test('duplicate requests rejected, missing gh and no-update handled without installs',async()=>{
   let finish;const gate=new Promise(r=>finish=r);
   const updater=createRemoteUpdater({currentVersion:'0.3.0',locateGh:async()=>'/gh',command:async()=>{await gate;return {stdout:JSON.stringify(release())};}});

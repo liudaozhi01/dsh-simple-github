@@ -12,6 +12,7 @@ const releaseRefusals = new Map([
   ['Existing services must be healthy', '发布前检查失败：当前环境服务不健康，请先排查并恢复服务；本次发布尚未启动。'],
   ['Expected one existing container per service', '发布前检查失败：当前环境存在缺失或未运行的服务容器；本次发布尚未启动。'],
   ['Another release operation is active', '服务器已有发布操作正在执行，请先查询状态，不要重复发布。'],
+  ['Unresolved job blocks new deployment', '当前环境有旧的未解决发布任务阻止新部署，请先查询任务状态并只读核对；本次发布尚未启动，不要重复发布。'],
 ]);
 function knownReleaseRefusal(text) {
   if (typeof text !== 'string' || text.length > 65536) return;
@@ -20,6 +21,28 @@ function knownReleaseRefusal(text) {
   for (const [source, message] of releaseRefusals) {
     if (text.split(/\r?\n/).some(line => line === source || line.endsWith(': ' + source) || line === message)) return message;
   }
+}
+function refusalStatus(reason) {
+  return reason === releaseRefusals.get('Unresolved job blocks new deployment') ? 409 : 503;
+}
+const releaseStageLabels = Object.freeze({
+  queued: '排队中', preflight: '发布前检查', building: '服务器编译',
+  applying: '更新服务', health: '健康检查', 'awaiting-acceptance': '等待验收',
+});
+function unresolvedActivityMessage(job) {
+  if (!Object.hasOwn(job, 'activity')) return '任务记录未完成，服务器尚未提供活动核验，请核对/升级';
+  const activity = job.activity;
+  if (!activity || ![Object.prototype, null].includes(Object.getPrototypeOf(activity)) ||
+    !['active', 'interrupted', 'unknown', 'finished'].includes(activity.state)) return '无法确认发布活动，暂不发布';
+  if (activity.state === 'interrupted') return '上次发布已中断，待核对';
+  // Activity is diagnostic only: even "finished" cannot resolve an unfinished job.
+  if (activity.state !== 'active') return '无法确认发布活动，暂不发布';
+  const actor = typeof job.actor === 'string'
+    ? Array.from(job.actor.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '').trim()).slice(0, 80).join('') : '';
+  const details = [];
+  if (typeof job.stage === 'string' && Object.hasOwn(releaseStageLabels, job.stage)) details.push('阶段：' + releaseStageLabels[job.stage]);
+  if (Number.isSafeInteger(job.createdAt) && job.createdAt >= 0 && job.createdAt <= 253402300799) details.push('创建时间：' + new Date(job.createdAt * 1000).toISOString());
+  return `${actor || '某位成员'}正在发布 ${job.environment}${details.length ? '（' + details.join('；') + '）' : ''}；暂不重复发布`;
 }
 function object(value, keys) {
   if (!value || ![Object.prototype, null].includes(Object.getPrototypeOf(value)) || Reflect.ownKeys(value).some(k => !keys.includes(k) || !Object.hasOwn(Object.getOwnPropertyDescriptor(value, k), 'value'))) throw fail('发布请求字段无效');
@@ -37,7 +60,9 @@ const python = code => `sudo -n /usr/bin/python3 -I - <<'DSH_TEMPORARY_RELEASE'\
  * request({profile,action,body,bundle?}) -> remote JSON. bundle is trusted local metadata.
  * bridge/script injection is for local tests only, never HTTP input.
  */
-export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, script: injectedScript, team = false } = {}) {
+export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, script: injectedScript, team = false, projectId } = {}) {
+  if (projectId !== undefined && (!team || typeof projectId !== 'string' || !/^[a-z][a-z0-9-]{0,39}$(?![\s\S])/.test(projectId))) throw new TypeError('Invalid controlled deployment project ID');
+  const entryPath = projectId === undefined ? '/usr/local/libexec/xian-oa-team-entry.py' : `/usr/local/libexec/dsh-release-${projectId}/entry.py`;
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new TypeError('Loopback DSH port required');
   let closed = false;
   const requests = new Set();
@@ -86,7 +111,7 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
       let responseReason;
       try { responseReason = knownReleaseRefusal(JSON.parse(result.stdout)?.error); } catch { /* Non-JSON SSH failures stay private. */ }
       const reason = responseReason || knownReleaseRefusal(result.stderr) || knownReleaseRefusal(result.stdout);
-      if (reason) throw fail(reason, 503);
+      if (reason) throw fail(reason, refusalStatus(reason));
     }
     if (!result || result.exitCode !== 0 || result.timedOut || result.truncated || typeof result.stdout !== 'string') throw fail('远程操作未明确响应；请查询状态，不要重复提交发布', 503);
     return result.stdout;
@@ -98,6 +123,12 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
     if (bundle) { if (action !== 'start') throw fail('仅开发启动允许源码包'); bundle = bundleInfo({ ...bundle, cleanup() {} }); }
     if (team) {
       const identity = await host(profile);
+      if (projectId !== undefined) {
+        const handshake = await exec(profile, `/usr/bin/python3 -I ${entryPath} '${encode({action:'overview',body:{}})}'`);
+        let info; try { info = JSON.parse(handshake); } catch { throw fail('服务器部署身份响应无效', 503); }
+        if (info?.error || info?.deploymentProjectId !== projectId || info?.deploymentProtocolVersion !== 1 || info?.deploymentRepository !== profile.repository || info?.deploymentBranch !== profile.branch) throw fail('服务器部署身份或协议不匹配，未上传源码或提交发布', 503);
+        if (await host(profile) !== identity) throw fail('SSH 配置已变化', 503);
+      }
       let remoteBundle;
       if (bundle) {
         const upload = '/tmp/dsh-upload-' + randomUUID();
@@ -115,7 +146,7 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
       if (await host(profile) !== identity) throw fail('SSH 配置已变化', 503);
       // Only action/body cross the privilege boundary. Server owns profile and ACL.
       const payload = { action, body: { ...body, ...(remoteBundle ? { bundle: remoteBundle } : {}) } };
-      const output = await exec(profile, `/usr/bin/python3 -I /usr/local/libexec/xian-oa-team-entry.py '${encode(payload)}'`);
+      const output = await exec(profile, `/usr/bin/python3 -I ${entryPath} '${encode(payload)}'`);
       if (Buffer.byteLength(output) > 65536) throw fail('发布响应超过限制', 503);
       try { return JSON.parse(output); } catch { throw fail('发布响应格式无效', 503); }
     }
@@ -146,11 +177,12 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
  * source.prepare({repository,branch,head}) -> {path,sha256,size,cleanup}.
  * Injected transport is a callable(request) or {request,close}; it receives immutable profile.
  */
-export function createTemporaryReleaseClient({ port, getUser, profile: inputProfile, source, transport, team = false } = {}) {
+export function createTemporaryReleaseClient({ port, getUser, profile: inputProfile, source, transport, team = false, projectId } = {}) {
   const profile = validateReleaseProfile(inputProfile);
   if (typeof getUser !== 'function') throw new TypeError('Trusted getUser required');
   if (source !== undefined && (typeof source.resolve !== 'function' || typeof source.prepare !== 'function')) throw new TypeError('Trusted source.resolve/prepare required');
-  const channel = transport ?? createTemporaryReleaseTransport({ port, team });
+  if (projectId !== undefined && (!team || typeof projectId !== 'string' || !/^[a-z][a-z0-9-]{0,39}$(?![\s\S])/.test(projectId))) throw new TypeError('Invalid controlled deployment project ID');
+  const channel = transport ?? createTemporaryReleaseTransport({ port, team, projectId });
   const run = typeof channel === 'function' ? channel : channel?.request?.bind(channel);
   if (typeof run !== 'function') throw new TypeError('Trusted transport required');
   let closed = false;
@@ -165,10 +197,34 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
     ensure();
     let response;
     try { response = await run({ profile, action, body: structuredClone(body), ...(bundle ? { bundle } : {}) }); }
-    catch (error) { throw fail(knownReleaseRefusal(error?.message) || '临时发布入口未明确响应；请查询状态，不要重复提交发布', 503); }
+    catch (error) {
+      const reason = knownReleaseRefusal(error?.message);
+      throw fail(reason || '临时发布入口未明确响应；请查询状态，不要重复提交发布', reason ? refusalStatus(reason) : 503);
+    }
     ensure();
-    if (!response || ![Object.prototype, null].includes(Object.getPrototypeOf(response)) || response.ok === false || Object.hasOwn(response, 'error')) throw fail('临时发布入口拒绝或未明确响应；请查询状态', 503);
+    if (!response || ![Object.prototype, null].includes(Object.getPrototypeOf(response))) throw fail('临时发布入口拒绝或未明确响应；请查询状态', 503);
+    if (response.ok === false || Object.hasOwn(response, 'error')) {
+      const reason = knownReleaseRefusal(response.error);
+      throw fail(reason || '临时发布入口拒绝或未明确响应；请查询状态', reason ? refusalStatus(reason) : 503);
+    }
+    if (projectId !== undefined && (response.deploymentProjectId !== projectId || response.deploymentProtocolVersion !== 1 || response.deploymentRepository !== profile.repository || response.deploymentBranch !== profile.branch)) throw fail('服务器部署项目身份不匹配，请核对初始化配置', 503);
     return structuredClone(response);
+  }
+  async function preflight(environment) {
+    if (!team) return;
+    const overview = await call('overview', {});
+    // Missing or ambiguous history must never be interpreted as an idle environment.
+    if (!Array.isArray(overview.jobs) || !overview.jobs.every(job => job &&
+      [Object.prototype, null].includes(Object.getPrototypeOf(job)) &&
+      typeof job.jobId === 'string' && ID.test(job.jobId) &&
+      ['dev', 'test'].includes(job.environment) &&
+      ['pending', 'running', 'uncertain', 'delivered', 'failed', 'ready', 'accepted'].includes(job.status))) throw fail('发布任务概览格式无效；未准备源码或启动发布，请先查询状态', 503);
+    const unresolved = overview.jobs.filter(job => job.environment === environment && ['pending', 'running', 'uncertain'].includes(job.status));
+    if (unresolved.length) {
+      // Prefer a positively verified active publisher over stale history in the same environment.
+      const job = unresolved.find(job => job.activity?.state === 'active') || unresolved[0];
+      throw fail(unresolvedActivityMessage(job), 409);
+    }
   }
   function remember(response, environment, expectedHead) {
     id(response.planId);
@@ -182,6 +238,7 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
     async check(input = {}) {
       object(input, []); ensure();
       if (!source) throw fail('未配置本地安全源码打包器', 503);
+      await preflight('dev');
       const remote = await source.resolve({ repository: profile.repository, branch: profile.branch }); ensure();
       if (remote?.repository !== profile.repository || remote?.branch !== profile.branch || !SHA.test(remote?.head || '')) throw fail('远程分支源码身份无效', 503);
       const head = remote.head;
@@ -210,6 +267,7 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
       await owner([plan.environment]);
       if (plan.expiresAt <= Date.now() / 1000) throw fail('计划已过期，请重新检查');
       plans.delete(body.planId); // One use before source preparation/upload; never replay writes.
+      await preflight(plan.environment);
       let bundle;
       try {
         if (plan.environment === 'dev' && !plan.restore) {

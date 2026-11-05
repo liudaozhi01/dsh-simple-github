@@ -96,6 +96,27 @@ def atomic(path, value, raw=False):
         if temporary.exists():
             temporary.unlink()
 
+def process_identity(pid):
+    """Linux PID identity only; never inspect command lines or worker arguments.
+
+    None proves the PID absent. Unavailable/malformed proc evidence raises and
+    must remain unknown, not be confused with a dead worker.
+    """
+    require(type(pid) is int and pid > 0, 'Invalid worker PID')
+    try:
+        text = Path('/proc').joinpath(str(pid), 'stat').read_text()
+    except FileNotFoundError:
+        # A missing proc mount is not evidence that a particular PID is gone.
+        require(Path('/proc/self/stat').is_file(), 'Process evidence unavailable')
+        return None
+    # comm may contain spaces and parentheses; field 22 is index 19 after comm.
+    fields = text.rsplit(')', 1)[1].split()
+    require(text.split(' ', 1)[0] == str(pid) and len(fields) >= 20 and fields[19].isdecimal(), 'Invalid process evidence')
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    require(re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', boot), 'Invalid boot evidence')
+    return {'bootId': boot, 'startTime': fields[19]}
+
+
 def opt_root(value):
     require(type(value) is str and re.fullmatch(r'/opt/[A-Za-z0-9_/-]+', value), 'Controlled absolute /opt path required')
     p = Path(value)
@@ -208,6 +229,10 @@ class Release:
         self.stage_identity = self.stage.stat()
         self.keep_stage = False
         broker = os.environ.get('DSH_RELEASE_BROKER') == '1'
+        # Only the trusted broker's clean child environment supplies this value;
+        # it is not part of the member request/profile schema.
+        self.project_id = os.environ.get('DSH_RELEASE_PROJECT_ID')
+        require(self.project_id is None or (broker and re.fullmatch(r'[a-z][a-z0-9-]{0,39}', self.project_id)), 'Invalid broker project identity')
         allowed = {'script.py', 'archive.tar.gz', 'build.py'} if broker else {'script.py', 'archive.tar.gz'}
         require(set(p.name for p in self.stage.iterdir()) <= allowed, 'Unexpected temporary stage contents')
         self.profile = validate_profile(profile)
@@ -249,6 +274,8 @@ class Release:
             mysql_image = os.environ.get('DSH_RELEASE_MYSQL_IMAGE', '')
             require(PIN.fullmatch(mysql_image), 'Reviewed isolated MySQL image required')
             self.env['DSH_RELEASE_MYSQL_IMAGE'] = mysql_image
+            if self.project_id is not None:
+                self.env['DSH_RELEASE_PROJECT_ID'] = self.project_id
 
     def authorize(self, environment):
         require(environment in self.roots, 'Unknown environment')
@@ -264,10 +291,10 @@ class Release:
 
     @contextlib.contextmanager
     def lock(self, name, blocking=True):
-        # Coordinate the new shared broker with this server's existing release CLI.
-        # Different state roots must not create independent deployment authorities.
+        # Legacy OA must coordinate with its existing release CLI globally.
+        # Generic projects instead coordinate through their own stateRoot locks.
         legacy_fd = None
-        if getattr(self, 'broker', False) and name.startswith('operation-'):
+        if getattr(self, 'broker', False) and getattr(self, 'project_id', None) is None and name.startswith('operation-'):
             legacy = Path('/var/lib/xian-oa-release/.release.lock')
             secure(legacy.parent, True)
             legacy_fd = os.open(legacy, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -289,6 +316,65 @@ class Release:
                 os.close(fd)
             if legacy_fd is not None:
                 os.close(legacy_fd)
+
+    @contextlib.contextmanager
+    def operation_lock_observation(self, environment):
+        """Observe an existing lock without creating files or waiting for workers."""
+        fd = None
+        observation = 'unknown'
+        try:
+            require(environment in ('dev', 'test'), 'Invalid lock environment')
+            path = self.state / ('operation-' + environment + '.lock')
+            secure(path)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            before = os.fstat(fd)
+            require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1, 'Unsafe operation lock')
+            try:
+                # A shared probe conflicts with the worker's exclusive flock but
+                # not with other readers. Keep it until process evidence is read.
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                observation = 'free'
+            except BlockingIOError:
+                observation = 'held'
+            after = path.lstat()
+            require(not stat.S_ISLNK(after.st_mode) and (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), 'Operation lock replaced')
+        except (OSError, Refused, ValueError):
+            observation = 'unknown'
+        try:
+            yield observation
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def activity(self, job):
+        if job.get('status') in ('ready', 'accepted', 'failed'):
+            return {'state': 'finished'}
+        state = 'unknown'
+        pid = job.get('workerPid')
+        if type(pid) is not int or pid <= 0:
+            # Includes the persist-before-spawn gap. No PID is not proof of exit.
+            return {'state': state}
+        try:
+            with self.operation_lock_observation(job.get('environment')) as lock:
+                current = process_identity(pid)
+                recorded = job.get('workerIdentity')
+                valid = (type(recorded) is dict and set(recorded) == {'bootId', 'startTime'}
+                         and type(recorded['bootId']) is str and type(recorded['startTime']) is str
+                         and re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}', recorded['bootId'])
+                         and recorded['startTime'].isdecimal())
+                if current is None or (valid and current != recorded):
+                    if lock == 'free':
+                        state = 'interrupted'
+                elif valid and current == recorded and lock == 'held':
+                    # Recheck identity after lock evidence to reject exit/reuse races.
+                    if process_identity(pid) == recorded:
+                        state = 'active'
+        except (OSError, Refused, ValueError, IndexError):
+            pass
+        return {'state': state}
+
+    def observed_public_job(self, job):
+        return {**self.public_job(job), 'activity': self.activity(job)}
 
     def get(self, kind, key):
         return loads(secure(self.state / (kind + '-' + identifier(key) + '.json')).read_text())
@@ -575,6 +661,14 @@ class Release:
             self.last_failure_details = []
             try:
                 job.update(status='running', stage='preflight', workerPid=os.getpid())
+                try:
+                    identity = process_identity(job['workerPid'])
+                    if identity is not None:
+                        job['workerIdentity'] = identity
+                except (OSError, Refused, ValueError, IndexError):
+                    # Publishing may proceed if proc is unavailable, but readers
+                    # must not label this worker active without identity evidence.
+                    pass
                 self.put('job', key, job)
                 require(time.time() <= plan['expiresAt'], 'Plan expired before worker start')
                 environment = plan['environment']
@@ -637,14 +731,14 @@ class Release:
         if 'jobId' in body:
             job = self.get('job', body['jobId'])
             self.authorize(job['environment'])
-            return self.public_job(job)
+            return self.observed_public_job(job)
         values = []
         for path in self.state.glob('job-*.json'):
             job = loads(secure(path).read_text())
             if job.get('actor') == self.user:
                 values.append(job)
         values.sort(key=lambda j: j['createdAt'], reverse=True)
-        return self.public_job(values[0]) if values else {'status': 'idle'}
+        return self.observed_public_job(values[0]) if values else {'status': 'idle'}
 
     def overview(self, body):
         obj(body, ['authorizedEnvironments'])
@@ -661,7 +755,7 @@ class Release:
                 releases.append(job)
         jobs.sort(key=lambda j: (j.get('createdAt', 0), j['jobId']), reverse=True)
         releases.sort(key=lambda j: (j.get('updatedAt', j.get('createdAt', 0)), j['jobId']), reverse=True)
-        return {'jobs': [self.public_job(job) for job in jobs[:20]], 'releaseId': releases[0]['jobId'] if releases else None}
+        return {'jobs': [self.observed_public_job(job) for job in jobs[:20]], 'releaseId': releases[0]['jobId'] if releases else None}
 
     @staticmethod
     def public_job(job):
@@ -691,7 +785,7 @@ class Release:
         observed = self.observe(job['environment'])
         override = self.active_override(job['environment'])
         config = self.config_snapshot(job['environment'], override=override)
-        return {**self.public_job(job), 'observed': observed, 'matchesRecordedImages': self.matches(job, observed) if job.get('images') and job.get('previous') else False, 'matchesRecordedCompose': digest(config) == job.get('appliedFingerprint'), 'readOnly': True}
+        return {**self.observed_public_job(job), 'observed': observed, 'matchesRecordedImages': self.matches(job, observed) if job.get('images') and job.get('previous') else False, 'matchesRecordedCompose': digest(config) == job.get('appliedFingerprint'), 'readOnly': True}
 
     def accept(self, body):
         obj(body, ['jobId', 'confirmation'], ['jobId', 'confirmation'])
