@@ -44,6 +44,35 @@ test('CRLF builtin conversion preserves dirty staged/unstaged raw bytes and conv
  assert.equal(await f.git(['show',':hello.txt']),'staged\n');assert.equal(await readFile(join(f.directory,'hello.txt'),'utf8'),'unstaged\r\n');
  assert.equal(await readFile(join(f.directory,'remote.txt'),'utf8'),'remote\r\n');assert.equal(await readFile(join(f.directory,'other.txt'),'utf8'),'REMOTE\r\n');
 });
+test('clean LF files with autocrlf=true sync without rewriting unchanged bytes',async t=>{
+ for(const remoteChangesFile of [false,true]) {
+  const f=await fixture(t,remoteChangesFile?{'hello.txt':'incoming\n'}:undefined);
+  await f.git(['config','core.autocrlf','true']);
+  assert.match(await f.git(['ls-files','--eol','hello.txt']),/i\/lf\s+w\/lf/);
+  assert.equal((await f.git(['status','--porcelain'])).trim(),'');
+  assert.deepEqual(await f.invoke(),{ok:true,conflict:false});
+  assert.equal((await f.git(['rev-parse','HEAD'])).trim(),f.remoteHead);
+  assert.equal(await readFile(join(f.directory,'hello.txt'),'utf8'),remoteChangesFile?'incoming\r\n':'base\n');
+  assert.equal(await readFile(join(f.directory,'layers.txt'),'utf8'),'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\n');
+  assert.equal((await f.git(['status','--porcelain'])).trim(),'');
+ }
+});
+test('LF conversion exception does not admit unstaged, staged, untracked or binary bytes',async t=>{
+ for(const kind of ['unstaged','staged','untracked','binary','mixed-clean']) {
+  const f=await fixture(t);
+  if(kind==='mixed-clean') {
+   await writeFile(join(f.directory,'hello.txt'),'one\r\ntwo\n');await f.git(['add','hello.txt']);await f.git(['commit','-m','mixed']);
+  }
+  await f.git(['config','core.autocrlf','true']);
+  if(kind==='unstaged'||kind==='staged')await writeFile(join(f.directory,'hello.txt'),'local\n');
+  if(kind==='staged')await f.git(['add','hello.txt']);
+  if(kind==='untracked')await writeFile(join(f.directory,'new.txt'),'new\n');
+  if(kind==='binary') {await writeFile(join(f.directory,'hello.txt'),Buffer.from('base\0\n'));await writeFile(join(f.directory,'.gitattributes'),'hello.txt text\n');}
+  const before=await f.state();
+  await assert.rejects(f.invoke(),/round-trip/);
+  assert.deepEqual(await f.state(),before);assert.ok(!f.calls.some(c=>c.args.includes('fetch')));
+ }
+});
 test('mixed local line endings and nonreversible conversion fail closed without changing raw bytes',async t=>{
  for(const kind of ['mixed','ident','encoding']){
   const f=await fixture(t);await f.git(['config','core.autocrlf','true']);

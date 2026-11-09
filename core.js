@@ -507,7 +507,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
       const indexTree = (await safeGit(directory,['write-tree'],options)).stdout.trim();
       const indexEntries = await regularTree(directory,indexTree,safeGit);
       const fileMode = (await safeGit(directory,['config','--type=bool','--default=true','--get','core.fileMode'])).stdout.trim() !== 'false';
-      await regularTree(directory,current.head,safeGit);
+      const headEntries = await regularTree(directory,current.head,safeGit);
       const paths = [...new Set((await safeGit(directory,['ls-files','--cached','--others','--exclude-standard','-z'])).stdout.split('\0').filter(Boolean))];
       assertDistinctPaths(paths);
       // Git's builtin text/eol conversion keeps CRLF worktrees out of the
@@ -523,7 +523,20 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         if (!checkedPaths.has(path)) throw new ApiError('Files changed during batch attribute check; refresh the preview',409);
         const oid = (await safeGit(directory,['hash-object','-w',`--path=${path}`,'--',path])).stdout.trim();
         const roundtrip = (await safeGit(directory, ['cat-file','--filters',`--path=${path}`,oid], {encoding:null,maxOutput:64 * 1024 * 1024})).stdout;
-        if (!(await readFile(join(directory,path))).equals(roundtrip)) throw new ApiError('Safe sync cannot round-trip local line endings/conversion without changing raw bytes; normalize or save these files explicitly before retrying: ' + path,409);
+        const raw = await readFile(join(directory,path));
+        if (!raw.equals(roundtrip)) {
+          // autocrlf=true may smudge an otherwise clean LF file to CRLF.
+          // Only exempt an exact HEAD/index blob, with no staged/content/mode
+          // edits and a strictly LF -> CRLF difference. Unchanged paths are not
+          // written by layeredSync; changed incoming paths use Git conversion.
+          const indexed = indexEntries.get(path), committed = headEntries.get(path);
+          const cleanEntry = indexed && committed && indexed.oid === oid && committed.oid === oid && indexed.mode === committed.mode &&
+            (!fileMode || process.platform === 'win32' || !!(info.mode & 0o111) === (indexed.mode === '100755'));
+          const pureLfConversion = !raw.includes(0) && !raw.includes(13) && raw.includes(10) &&
+            Buffer.from(raw.toString('latin1').replace(/\n/g,'\r\n'),'latin1').equals(roundtrip);
+          const blob = cleanEntry && pureLfConversion ? (await safeGit(directory,['cat-file','blob',oid],{encoding:null,maxOutput:64 * 1024 * 1024})).stdout : null;
+          if (!blob || !raw.equals(blob)) throw new ApiError('Safe sync cannot round-trip local line endings/conversion without changing raw bytes; normalize or save these files explicitly before retrying: ' + path,409);
+        }
         const mode = (!fileMode || process.platform === 'win32') ? indexEntries.get(path)?.mode || '100644' : info.mode & 0o111 ? '100755' : '100644';
         if (!/^[0-9a-f]{40}$/.test(oid)) throw new ApiError('Invalid file object SHA during safe sync',409);
         indexUpdates.push(mode+' '+oid+'\t'+path+'\0');
