@@ -188,6 +188,8 @@ class BrokerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=pathlib.Path(tmp);engine=root/'engine.py';engine.write_text('# trusted engine')
             helper=root/'helper.py';helper.write_text('# trusted build')
+            for name in ('xian-oa-test-database.py','xian-oa-test-schema-plan.py'):
+                (root/name).write_text('# trusted database helper')
             self.config['mysqlImage']='mysql@sha256:'+'1'*64
             real_path=pathlib.Path
             def path(value): return root if value=='/var/tmp' else real_path(value)
@@ -198,12 +200,14 @@ class BrokerTests(unittest.TestCase):
                 self.assertEqual(user,'alice'); return {'planId':'a'*32}
             with patch.object(b,'Path',side_effect=path),patch.object(b,'ENGINE',engine),patch.object(b,'BUILD',helper),patch.object(b,'private'),patch.object(b.pwd,'getpwuid',return_value=SimpleNamespace(pw_name='alice')),patch.object(b,'execute',side_effect=execute):
                 self.assertEqual(self.broker.dispatch({'action':'check','body':{'head':'c'*40}},1001),{'planId':'a'*32})
-            self.assertEqual(sorted(p.name for p in root.iterdir()),['engine.py','helper.py'])
+            self.assertEqual(sorted(p.name for p in root.iterdir()),['engine.py','helper.py','xian-oa-test-database.py','xian-oa-test-schema-plan.py'])
 
     def test_dev_restore_start_retains_worker_stage_without_bundle(self):
         from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as tmp:
             root=pathlib.Path(tmp);engine=root/'engine.py';engine.write_text('# engine');helper=root/'helper.py';helper.write_text('# build')
+            for name in ('xian-oa-test-database.py','xian-oa-test-schema-plan.py'):
+                (root/name).write_text('# trusted database helper')
             self.config['mysqlImage']='mysql@sha256:'+'1'*64
             real_path=pathlib.Path;plan={'actor':'alice','environment':'dev','operation':'restore'}
             def record(kind,key):return plan if kind=='plan' else {'jobId':'b'*32}

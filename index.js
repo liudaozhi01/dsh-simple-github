@@ -11,7 +11,12 @@ import { createEnvironmentSetup } from './environment-setup.js';
 import { createRemoteDeploy } from './remote-deploy.js';
 import { createNativeDevDeploy } from './native-dev-deploy.js';
 import { createDockerPreview } from './docker-preview.js';
-import { createTemporaryReleaseClient } from './temporary-release-client.js';
+import { createTemporaryReleaseClient, createTemporaryReleaseTransport } from './temporary-release-client.js';
+import { createNativeSsh } from './native-ssh.js';
+import { DEFAULT_RELEASE_PROFILE } from './release-profile.js';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { createLocalSourceBundle } from './local-source-bundle.js';
 export const inject = ['webServer'];
 export function apply(ctx, config = {}) {
@@ -23,7 +28,13 @@ export function apply(ctx, config = {}) {
   const oaProject = project.repository.toLowerCase() === 'ssal-team/xian-oa' && project.branch === 'dev';
   const getUser = async () => (await service.route('status')).user;
   const runtimeProfile = oaProject ? config.releaseProfile : null;
-  const dockerRuntime = config.dockerRuntime === undefined ? (runtimeProfile ? createTemporaryReleaseClient({ port: ctx.webServer.port, team: true, profile: runtimeProfile, source: createLocalSourceBundle(), getUser }) : null) : config.dockerRuntime;
+  const sshTarget = (runtimeProfile || DEFAULT_RELEASE_PROFILE).target;
+  const sshNamespace = createHash('sha256').update(JSON.stringify([sshTarget.alias, sshTarget.host, sshTarget.port])).digest('hex').slice(0, 24);
+  // Local per-member settings, outside the distributable plugin and repository.
+  const nativeSsh = oaProject ? createNativeSsh({ directory: join(homedir(), '.dsh-simple-github', 'ssh-' + sshNamespace), target: sshTarget }) : null;
+  if (nativeSsh) ctx.effect(() => () => nativeSsh.close());
+  const dockerRuntime = config.dockerRuntime === undefined ? (runtimeProfile ? createTemporaryReleaseClient({ port: ctx.webServer.port, team: true, profile: runtimeProfile, source: createLocalSourceBundle(), getUser,
+    transport: createTemporaryReleaseTransport({ port: ctx.webServer.port, team: true, bridge: nativeSsh.bridge }) }) : null) : config.dockerRuntime;
   if (dockerRuntime !== null && (!dockerRuntime || ['check','promotion','start','status','accept','reconcile'].some(key => typeof dockerRuntime[key] !== 'function'))) throw new TypeError('Trusted Docker runtime capability required.');
   if (config.dockerRuntime === undefined && dockerRuntime) ctx.effect(() => () => dockerRuntime.close());
   const dockerPreview = createDockerPreview({ inspect: service.inspect, getUser: async () => (await service.route('status')).user });
@@ -43,7 +54,7 @@ export function apply(ctx, config = {}) {
     try {
       checkRequest(req, { port: ctx.webServer.port, csrfVerified: service.tokenMatches(req.headers['x-simple-git-token']) });
       const url = new URL(req.url, 'http://localhost');
-      const assets = { '/simple-github/error-feedback.js': ['error-feedback.js','text/javascript; charset=utf-8'], '/simple-github/auto-install.js': ['auto-install.js','text/javascript; charset=utf-8'], '/simple-github/panel.js': ['panel.js','text/javascript; charset=utf-8'], '/simple-github/panel.css': ['panel.css','text/css; charset=utf-8'] };
+      const assets = { '/simple-github/schema-review-message.js': ['schema-review-message.js','text/javascript; charset=utf-8'], '/simple-github/error-feedback.js': ['error-feedback.js','text/javascript; charset=utf-8'], '/simple-github/auto-install.js': ['auto-install.js','text/javascript; charset=utf-8'], '/simple-github/panel.js': ['panel.js','text/javascript; charset=utf-8'], '/simple-github/panel.css': ['panel.css','text/css; charset=utf-8'] };
       if (assets[url.pathname]) {
         if (req.method !== 'GET') throw new ApiError('GET required', 405);
         const [file, type] = assets[url.pathname]; const data = await readFileAsync(new URL(file, import.meta.url));
@@ -52,12 +63,19 @@ export function apply(ctx, config = {}) {
       if (!url.pathname.startsWith(`${API_BASE}/`)) throw new ApiError('Not found', 404);
       const name = url.pathname.slice(API_BASE.length + 1);
       const get = name === 'status' || (name === 'login' && url.searchParams.has('id'));
-      const routes = ['github-config-read','github-config-save','docker-overview','docker-status','docker-accept','docker-reconcile','docker-start','docker-plan','docker-promote','docker-restore','docker-preview','error-notify','remote-dev-check','remote-dev-start','remote-dev-status','remote-deploy-notify','environment-inspect','environment-notify','update-check','update-install','choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
+      const routes = ['ssh-key-discover','ssh-config-read','ssh-config-save','ssh-host-scan','ssh-host-trust','ssh-connection-test','github-config-read','github-config-save','docker-overview','docker-status','docker-accept','docker-reconcile','docker-start','docker-plan','docker-promote','docker-restore','docker-preview','error-notify','remote-dev-check','remote-dev-start','remote-dev-status','remote-deploy-notify','environment-inspect','environment-notify','update-check','update-install','choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','source-history','source-restore-preview','source-restore','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
       if (!routes.includes(name)) throw new ApiError('Not found', 404);
       if (req.method !== (get ? 'GET' : 'POST')) throw new ApiError(get ? 'GET required' : 'POST required', 405);
       let body = {};
       if (!get) { if (!service.tokenMatches(req.headers['x-simple-git-token'])) throw new ApiError('Missing or invalid CSRF token; refresh status', 403); body = await readJson(req); }
       if (name === 'status') { const status = await service.route('status'); reply(200, {...status, project, githubAdministrator:status.user?.login?.toLowerCase() === GITHUB_ADMINISTRATOR, oaDeploymentAvailable:oaProject}); return; }
+      if (name.startsWith('ssh-')) {
+        if (!nativeSsh) throw new ApiError('当前项目未适配发布服务器连接', 409);
+        const keys = name === 'ssh-config-save' ? ['user','privateKeyPath'] : name === 'ssh-host-trust' ? ['fingerprint'] : [];
+        if (!body || ![Object.prototype,null].includes(Object.getPrototypeOf(body)) || Object.keys(body).length !== keys.length || Object.keys(body).some(key => !keys.includes(key))) throw new ApiError('服务器连接请求字段无效', 400);
+        const method = {'ssh-key-discover':'discover','ssh-config-read':'read','ssh-config-save':'save','ssh-host-scan':'scan','ssh-host-trust':'trust','ssh-connection-test':'test'}[name];
+        reply(200, await nativeSsh[method](body)); return;
+      }
       if (name === 'github-config-read') { reply(200, await configStore.read()); return; }
       if (name === 'github-config-save') { reply(200, await configStore.save(body)); return; }
       if (!oaProject && (name.startsWith('docker-') || name.startsWith('deploy-') || name.startsWith('remote-dev-') || ['remote-deploy-notify','environment-inspect','environment-notify'].includes(name))) throw new ApiError('当前项目未适配 OA 专属部署功能，不能使用原项目部署目标', 409);

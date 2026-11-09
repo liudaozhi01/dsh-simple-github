@@ -34,6 +34,7 @@ class Refused(Exception):
 def failure_details(text):
     """Only publish recognized structural errors, never arbitrary log lines/SQL."""
     patterns = (
+        r'预设超管初始化冲突：admin账号已绑定其他人员，请人工核对，不会自动换绑',
         r"Referencing column '[A-Za-z0-9_]+' and referenced column '[A-Za-z0-9_]+' in foreign key constraint '[A-Za-z0-9_]+' are incompatible\.",
         r'dependency failed to start: container [A-Za-z0-9_.-]+ is unhealthy',
         r'Bind for (?:[0-9.]+:)?[0-9]+ failed: port is already allocated',
@@ -233,7 +234,7 @@ class Release:
         # it is not part of the member request/profile schema.
         self.project_id = os.environ.get('DSH_RELEASE_PROJECT_ID')
         require(self.project_id is None or (broker and re.fullmatch(r'[a-z][a-z0-9-]{0,39}', self.project_id)), 'Invalid broker project identity')
-        allowed = {'script.py', 'archive.tar.gz', 'build.py'} if broker else {'script.py', 'archive.tar.gz'}
+        allowed = {'script.py', 'archive.tar.gz', 'build.py', 'database.py', 'schema-plan.py'} if broker else {'script.py', 'archive.tar.gz'}
         require(set(p.name for p in self.stage.iterdir()) <= allowed, 'Unexpected temporary stage contents')
         self.profile = validate_profile(profile)
         self.profile_id = digest(profile)
@@ -279,6 +280,27 @@ class Release:
 
     def authorize(self, environment):
         require(environment in self.roots, 'Unknown environment')
+
+    def database_enabled(self):
+        return getattr(self, 'broker', False) and getattr(self, 'project_id', None) is None
+
+    def database_helper(self, name):
+        import importlib.util
+        require(self.database_enabled(), 'Database automation requires reviewed OA broker')
+        validate_stage(self.entry)
+        require(name in ('database.py', 'schema-plan.py'), 'Unknown database helper')
+        helper = self.stage / name
+        helper_stat = helper.lstat()
+        require(stat.S_ISREG(helper_stat.st_mode) and helper_stat.st_uid == 0 and
+                stat.S_IMODE(helper_stat.st_mode) == 0o600 and helper_stat.st_nlink == 1,
+                'Private database helper required')
+        spec = importlib.util.spec_from_file_location(name.replace('-', '_'), helper)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def database(self, environment):
+        return self.database_helper('database.py').Database(self, environment)
 
     def cleanup(self):
         if self.keep_stage:
@@ -374,6 +396,9 @@ class Release:
         return {'state': state}
 
     def observed_public_job(self, job):
+        # Enrich the response only: never mutate historical jobs or replay deployment.
+        if job.get('status') in ('failed', 'uncertain') and job.get('stage') in ('applying', 'health') and job.get('images'):
+            job = {**job, 'errorDetails': self.deployment_failure_details(job)}
         return {**self.public_job(job), 'activity': self.activity(job)}
 
     def get(self, kind, key):
@@ -467,7 +492,7 @@ class Release:
     def observe(self, environment):
         result = {}
         for service in ('api', 'web', 'db'):
-            ids = self.compose(environment, ['ps', '-q', service]).split()
+            ids = self.compose(environment, ['ps', '-a', '-q', service], override=self.active_override(environment)).split()
             require(len(ids) == 1, 'Expected one existing container per service')
             rows = loads(self.run([self.config['docker'], 'inspect', ids[0]]))
             require(type(rows) is list and len(rows) == 1, 'Invalid container inspect')
@@ -478,7 +503,7 @@ class Release:
         return result
 
     def deployment_failure_details(self, job):
-        details = list(getattr(self, 'last_failure_details', []))
+        details = list(job.get('errorDetails', [])) + list(getattr(self, 'last_failure_details', []))
         # Read only the exact containers/images attempted by this job, including
         # stopped ones. Never return raw logs, configuration or SQL statements.
         for service in ('api', 'web'):
@@ -504,11 +529,17 @@ class Release:
             return self.plan(secrets.token_hex(16), 'dev', body['head'])
 
     def plan(self, key, environment, head, images=None, release=None):
+        if environment == 'test' and self.database_enabled():
+            for path in self.state.glob('job-*.json'):
+                prior = loads(secure(path).read_text())
+                require(not (prior.get('environment') == 'test' and prior.get('stage') == 'db-restore-failed'),
+                        'Test database recovery failed; manual recovery required before retry')
         override = self.active_override(environment)
         config = self.config_snapshot(environment, override=override)
         try:
             observed = self.observe(environment)
-            require(all(x['healthy'] for x in observed.values()), 'Existing services must be healthy')
+            schema_repair = environment == 'test' and self.database_enabled() and images is not None and release is not None
+            require(observed['db']['healthy'] and (schema_repair or all(x['healthy'] for x in observed.values())), 'Existing services must be healthy')
         except Refused as error:
             if str(error) not in ('Expected one existing container per service', 'Existing services must be healthy'):
                 raise
@@ -549,8 +580,38 @@ class Release:
         source = self.get('job', body['releaseId'])
         require(self.promotion_source(source), 'Successful dev job with images and head required')
         self.inspect_images(source['images'])
-        with self.lock('operation-test'):
-            return self.plan(secrets.token_hex(16), 'test', source['head'], source['images'], body['releaseId'])
+        with self.lock('operation-test', blocking=False):
+            result = self.plan(secrets.token_hex(16), 'test', source['head'], source['images'], body['releaseId'])
+            if self.database_enabled():
+                snapshot = source.get('databaseSchema')
+                require(snapshot is None or type(snapshot) is dict, 'Invalid dev schema snapshot')
+                observed_dev = self.observe('dev')
+                require(all(observed_dev[s]['healthy'] and observed_dev[s]['imageId'] == source['images'][s]
+                            for s in ('api', 'web')), 'Dev images changed since schema snapshot')
+                current_schema = self.database('dev').snapshot()
+                snapshot_origin = 'verified-dev-release'
+                if snapshot is None:
+                    # Legacy ready jobs predate schema capture. Bind a new plan to
+                    # the live healthy matching images; do not rewrite old jobs.
+                    snapshot = current_schema
+                    snapshot_origin = 'live-healthy-legacy-dev'
+                require(current_schema == snapshot, 'Dev schema changed since verified release; publish dev first')
+                target = self.database('test')
+                safe = self.database_helper('schema-plan.py')
+                target_schema = target.snapshot()
+                try:
+                    schema_plan = safe.plan_schema(snapshot, target_schema)
+                except ValueError:
+                    details = safe.review_details(snapshot, target_schema) if hasattr(safe, 'review_details') else []
+                    if details:
+                        # Only the diagnostic helper's structural allowlist crosses the boundary.
+                        raise Refused('SCHEMA_REVIEW_V1:' + json.dumps({'force': False, 'details': details}, ensure_ascii=False, separators=(',', ':')))
+                    raise Refused('Database schema difference requires manual review; no SQL executed')
+                plan = self.get('plan', result['planId'])
+                plan.update(databaseSchema=snapshot, databaseStatements=schema_plan, databaseSchemaOrigin=snapshot_origin)
+                self.put('plan', result['planId'], plan)
+                result['databaseChangeCount'] = len(schema_plan)
+            return result
 
     def restore(self, body):
         obj(body, ['environment', 'jobId'], ['environment', 'jobId'])
@@ -558,6 +619,7 @@ class Release:
         require(environment in ('dev', 'test'), 'Invalid restore environment')
         self.authorize(environment)
         source = self.get('job', body['jobId'])
+        require(not (environment == 'test' and self.database_enabled()), 'Test image-only restore requires database compatibility review')
         require(self.restore_source(source, environment), 'Successful same-environment job required')
         self.inspect_images(source['images'])
         with self.lock('operation-' + environment, blocking=False):
@@ -583,6 +645,7 @@ class Release:
             plan = self.get('plan', key)
             self.authorize(plan['environment'])
             require(plan['actor'] == self.user, 'Plan belongs to another server identity')
+            require(not any(k in plan for k in ('databaseMode', 'databaseForcePlan', 'databaseForcePreview', 'databasePreview')), 'Unknown database plan fields; request a new safe plan')
             if plan.get('jobId'):
                 job = self.get('job', plan['jobId'])
                 return self.public_job(job)
@@ -659,7 +722,15 @@ class Release:
             require(job['status'] == 'pending', 'Job already claimed')
             plan = self.get('plan', job['planId'])
             self.last_failure_details = []
+            database = None
+            backup = None
+            migrating = False
+            maintenance = False
+            def database_stage(stage):
+                job.update(stage=stage)
+                self.put('job', key, job)
             try:
+                require(not any(k in plan for k in ('databaseMode', 'databaseForcePlan', 'databaseForcePreview', 'databasePreview')), 'Unknown database plan fields; request a new safe plan')
                 job.update(status='running', stage='preflight', workerPid=os.getpid())
                 try:
                     identity = process_identity(job['workerPid'])
@@ -686,8 +757,39 @@ class Release:
                     images = plan['images']
                     self.inspect_images(images)
                 require(digest(self.config_snapshot(environment, override=override)) == plan['fingerprint'] and self.observe(environment) == plan['previous'], 'Deployment changed during build')
-                # Durable intent, previous IDs, config fingerprint and marker precede
-                # the first deployment mutation. No automatic rollback on any failure.
+                if environment == 'test' and self.database_enabled():
+                    # Bind against the actual running dev images as well as the
+                    # recorded successful job; old task IDs are not schema proof.
+                    dev_observed = self.observe('dev')
+                    require(all(dev_observed[s]['healthy'] and dev_observed[s]['imageId'] == images[s]
+                                for s in ('api', 'web')), 'Dev images changed since schema snapshot')
+                    require(self.database('dev').snapshot() == plan['databaseSchema'], 'Dev schema changed since verified release; publish dev first')
+                    require(plan.get('operation') != 'restore', 'Test image-only restore requires database compatibility review')
+                    database_stage('db-preflight')
+                    database = self.database('test')
+                    database.progress = database_stage
+                    def current_database_plan():
+                        return self.database_helper('schema-plan.py').plan_schema(plan['databaseSchema'], database.snapshot())
+                    statements = current_database_plan()
+                    require(statements == plan['databaseStatements'], 'Test database changed since plan')
+                    # Stop all application writers before backup, not after it.
+                    # External writers must be excluded by the reviewed DB helper.
+                    database_stage('db-maintenance')
+                    maintenance = True
+                    self.compose('test', ['stop', 'web', 'api'], override=override)
+                    backup = database.backup(key)
+                    job['database'] = {'status': 'backed-up', 'backup': backup}
+                    self.put('job', key, job)
+                    require(current_database_plan() == statements,
+                            'Test database changed during backup')
+                    job['database']['status'] = 'migrating'
+                    database_stage('db-migrating')
+                    migrating = True
+                    database.apply(statements)
+                    require(self.database_helper('schema-plan.py').plan_schema(plan['databaseSchema'], database.snapshot()) == [], 'Schema verification failed')
+                    job['database']['status'] = 'synchronized'
+                # Durable intent precedes image mutation. Database rollback is only
+                # automatic for a failed structure change, never image-only rollback.
                 job.update(stage='applying', previous=plan['previous'], fingerprint=plan['fingerprint'], images=images, head=plan['remote']['head'], marker=secrets.token_hex(16))
                 self.put('job', key, job)
                 text = OVERRIDE_HEADER + 'services:\n  api:\n    image: ' + images['api'] + '\n  web:\n    image: ' + images['web'] + '\n'
@@ -714,9 +816,32 @@ class Release:
                         pass
                     require(time.monotonic() < deadline, 'Health or image identity verification timed out')
                     time.sleep(2)
+                if environment == 'dev' and self.database_enabled():
+                    job['databaseSchema'] = self.database('dev').snapshot()
+                migrating = False  # Keep rollback armed through candidate image health.
                 job.update(status='ready', stage='awaiting-acceptance', observed=observed)
                 self.put('job', key, job)
             except Exception:
+                if migrating and database is not None and backup is not None:
+                    # DDL can partially commit. Restore the exact current backup,
+                    # while writers stay stopped, before returning any result.
+                    database_stage('db-restoring')
+                    job['database']['status'] = 'restoring'
+                    self.put('job', key, job)
+                    try:
+                        # Candidate apps may already be running after a failed health check.
+                        self.compose('test', ['stop', 'web', 'api'], override=self.active_override('test'))
+                        database.restore(backup)
+                        job['database']['status'] = 'restored'
+                        job.update(status='failed', stage='db-restored')
+                    except Exception:
+                        job['database']['status'] = 'restore-failed'
+                        job.update(status='uncertain', stage='db-restore-failed')
+                    self.put('job', key, job)
+                    return
+                if maintenance and job.get('stage', '').startswith('db-'):
+                    # No DDL attempted: retain backup, keep maintenance explicit.
+                    job['maintenance'] = True
                 # Persist only allowlisted structural diagnostics, not raw output.
                 details = self.deployment_failure_details(job) if job.get('stage') in ('applying', 'health') else list(getattr(self, 'last_failure_details', []))
                 job.update(status='uncertain' if job.get('stage') in ('applying', 'health') else 'failed', errorDetails=details, error='Server operation failed; inspect read-only reconcile and server diagnostics', finishedAt=int(time.time()))
@@ -768,11 +893,29 @@ class Release:
         result['updatedAt'] = updated
         end = job.get('finishedAt', updated if job['status'] in ('ready', 'accepted', 'failed', 'uncertain') else int(time.time()))
         result['elapsedSeconds'] = max(0, end - created)
+        if 'database' in job:
+            database = job['database']
+            result['database'] = {'status': database.get('status')}
+            if type(database.get('backup')) is dict:
+                result['database']['backup'] = {k: database['backup'][k] for k in ('id', 'createdAt') if k in database['backup']}
+        if job.get('stage') in ('db-restored', 'db-restore-failed'):
+            restored = job['stage'] == 'db-restored'
+            summary = ('test 数据库结构变更失败，已用本次备份恢复数据库；本次发布失败，应用保持停止待核对。'
+                       if restored else 'test 数据库结构变更失败，自动恢复也失败；保持维护状态，禁止重复发布，需要人工恢复。')
+            result.update(errorCode='DATABASE_RESTORED' if restored else 'DATABASE_RESTORE_FAILED',
+                          errorSummary=summary, error=summary, maintenance=True)
+            return result
         if job['status'] in ('failed', 'uncertain'):
             code = 'DELIVERY_UNCERTAIN' if job['status'] == 'uncertain' else 'BUILD_FAILED' if job.get('stage') == 'building' else 'RELEASE_FAILED'
             details = failure_details('\n'.join(x for x in job.get('errorDetails', []) if isinstance(x, str)))
-            stages = {'building': '服务器编译', 'applying': '更新服务', 'health': '健康检查'}
+            stages = {'building': '服务器编译', 'applying': '更新服务', 'health': '健康检查',
+                      'db-preflight': '数据库结构预检查', 'db-maintenance': '进入维护阶段',
+                      'db-backup': 'test 数据库备份', 'db-backup-verify': '备份恢复验证',
+                      'db-backup-cleanup': '旧备份清理', 'db-migrating': '数据库结构同步'}
             summary = stages.get(job.get('stage'), '服务器执行') + '失败。' + ('实际错误：' + '；'.join(details) + '。' if details else '未提取到可安全展示的具体错误，请按任务编号查看受控日志。')
+            if job.get('maintenance'):
+                summary += '尚未执行结构变更；test 应用保持停止，请核对后恢复服务。'
+                result['maintenance'] = True
             if job['status'] == 'uncertain':
                 summary += '服务器状态可能已改变，请只读核对；不要重复发布。'
             result.update(errorCode=code, errorSummary=summary, errorDetails=details, error=summary)

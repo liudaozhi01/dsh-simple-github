@@ -34,9 +34,10 @@ export function githubRemote(value) {
   if (!match) throw new ApiError('Only canonical HTTPS github.com origin is supported for writes; existing remotes are never rewritten');
   return repositorySlug(`${match[1]}/${match[2]}`);
 }
-export function runCommand(command, args, { cwd, env = process.env, timeout = 30000, maxOutput = MAX_OUTPUT, truncate = false, signal, onOutput, encoding = 'utf8' } = {}) {
+export function runCommand(command, args, { cwd, env = process.env, timeout = 30000, maxOutput = MAX_OUTPUT, truncate = false, signal, onOutput, encoding = 'utf8', input } = {}) {
   return new Promise((resolveResult, reject) => {
-    const child = spawnPortable(command, args, { cwd, env: normalizeEnv(env), detached:process.platform !== 'win32', stdio: ['ignore', 'pipe', 'pipe'] });
+    if (input !== undefined && typeof input !== 'string' && !Buffer.isBuffer(input)) { reject(new ApiError('Command input must be text or bytes')); return; }
+    const child = spawnPortable(command, args, { cwd, env: normalizeEnv(env), detached:process.platform !== 'win32', stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
     let stdout = Buffer.alloc(0), stderr = Buffer.alloc(0), total = 0, truncated = false, failure;
     let killTimer;
     const stop = error => { failure ||= error; void terminateTree(child).catch(() => { try { child.kill(); } catch {} }); };
@@ -53,6 +54,12 @@ export function runCommand(command, args, { cwd, env = process.env, timeout = 30
       if (total > maxOutput) { truncated = true; if (!truncate) stop(new ApiError('Command output exceeded safe limit')); }
     };
     child.stdout.on('data', collect('stdout')); child.stderr.on('data', collect('stderr'));
+    if (input !== undefined) {
+      // A child may reject/close stdin before all bytes are consumed. Surface the
+      // incomplete batch instead of crashing or accepting a partial index write.
+      child.stdin.on('error', () => stop(new ApiError('Unable to write command input')));
+      child.stdin.end(input);
+    }
     const cleanup = () => { clearTimeout(timer); clearTimeout(killTimer); signal?.removeEventListener('abort', abort); };
     child.on('error', error => { cleanup(); reject(new ApiError(error.code === 'ENOENT' ? 'Required executable not found' : 'Unable to start command')); });
     child.on('close', code => { cleanup(); if (failure) reject(failure); else if (code !== 0) reject(new ApiError(redact(stderr.toString('utf8') || stdout.toString('utf8') || `Command failed (${code})`).slice(0, 2000))); else resolveResult({ stdout: encoding === null ? stdout : stdout.toString(encoding), stderr: stderr.toString('utf8'), truncated }); });
@@ -117,7 +124,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
   if (typeof cloneBranch !== 'string' || !cloneBranch || cloneBranch.startsWith('-') || cloneBranch.startsWith('refs/') || cloneBranch === '@' || cloneBranch.length > 240 || /[\x00-\x20\x7f~^:?*\[\\]/.test(cloneBranch) || cloneBranch.includes('..') || cloneBranch.includes('@{') || cloneBranch.split('/').some(part => !part || part.startsWith('.') || part.endsWith('.') || part.endsWith('.lock'))) throw new ApiError('Invalid configured clone branch');
   const localRef = `refs/heads/${branch}`, trackingRef = `refs/remotes/origin/${branch}`, fetchRefspec = `+${localRef}:${trackingRef}`;
   const csrfToken = randomBytes(32).toString('hex'), locks = new Set(), logins = new Map(), clones = new Map(), controllers = new Set();
-  const conflictReports = new Map();
+  const conflictReports = new Map(), restorePreviews = new Map();
   let ghPromise, hooksPromise;
   const hooksDirectory = () => hooksPromise ||= mkdtemp(join(tmpdir(), 'simple-github-hooks-')).then(realpath);
   const cleanEnv = { ...normalizeEnv(env), GH_HOST: 'github.com', GH_PROMPT_DISABLED: '1', GIT_TERMINAL_PROMPT: '0', GH_PAGER: 'cat', PAGER: 'cat' };
@@ -184,11 +191,22 @@ export function createService({ ghPath, env = process.env, command = runCommand,
     const pushUrls = (await out(directory, ['remote', 'get-url', '--push', '--all', 'origin'])).split('\n');
     if (urls.length !== 1 || pushUrls.length !== 1 || githubRemote(urls[0]).toLowerCase() !== githubRemote(pushUrls[0]).toLowerCase()) throw new ApiError('Origin fetch and push must identify one matching HTTPS GitHub repository');
     const repository = githubRemote(urls[0]);
-    if (!await user()) throw new ApiError('Sign in to GitHub first', 401);
-    const metadata = JSON.parse((await gh(['repo', 'view', repository, '--json', 'nameWithOwner,defaultBranchRef'])).stdout);
+    const actor = await user();
+    if (!actor) throw new ApiError('Sign in to GitHub first', 401);
+    let metadata;
+    try {
+      metadata = JSON.parse((await gh(['repo', 'view', repository, '--json', 'nameWithOwner,defaultBranchRef'])).stdout);
+    } catch (error) {
+      // Only this read-only metadata request may fall back. Never replay Git writes
+      // or turn permission/authentication/validation failures into network retries.
+      const detail = [error.message, error.stderr].filter(Boolean).join('\n');
+      if (!/TLS handshake timeout|net\/http:.*timeout|i\/o timeout|connection (?:reset|refused)|network is unreachable|temporary failure in name resolution|dial tcp.*(?:timeout|no such host)/i.test(detail) || /HTTP\s*(?:401|403|404)|authentication|bad credentials|certificate/i.test(detail)) throw error;
+      const rest = JSON.parse((await gh(['api', `repos/${repository}`, '--hostname', 'github.com', '--method', 'GET'], { timeout: 30000 })).stdout);
+      metadata = { nameWithOwner: rest.full_name, defaultBranchRef: { name: rest.default_branch } };
+    }
     if (metadata.nameWithOwner?.toLowerCase() !== repository.toLowerCase() || !metadata.defaultBranchRef?.name) throw new ApiError('Unable to verify canonical GitHub repository/default branch');
     const baseBranch = metadata.defaultBranchRef.name;
-    return { ...info, repository, baseBranch };
+    return { ...info, repository, baseBranch, actor:actor.login };
   }
   async function credentialHelper() {
     const path = (await executable()).replace(/\\/g, '/');
@@ -310,12 +328,25 @@ export function createService({ ghPath, env = process.env, command = runCommand,
       } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     }
   }
-  async function layeredSync(directory, current, body, remoteHead, layers) {
+  async function checkSyncAttributes(directory, paths, safeGit, options = {}) {
+    if (!paths.length) return;
+    const names = ['ident','working-tree-encoding'], expected = new Set(paths), seen = new Set();
+    const raw = (await safeGit(directory,['check-attr','-z','--stdin',...names],{...options,input:paths.join('\0')+'\0',maxOutput:16*1024*1024})).stdout;
+    const records = raw.split('\0');
+    if (records.pop() !== '' || records.length !== paths.length * names.length * 3) throw new ApiError('Incomplete batch attribute response; no project files were changed',409);
+    for (let i=0;i<records.length;i+=3) {
+      const [path,name,value] = records.slice(i,i+3), key=JSON.stringify([path,name]);
+      if (!expected.has(path) || !names.includes(name) || seen.has(key)) throw new ApiError('Invalid batch attribute response; no project files were changed',409);
+      seen.add(key);
+      if (!['unspecified','unset'].includes(value)) throw new ApiError('Safe sync does not support ident or working-tree-encoding conversion; no project files were changed',409);
+    }
+  }
+  async function layeredSync(directory, current, body, remoteHead, layers, restore = null) {
     const safeGit = await isolatedCommands(directory), originalHead = current.head;
     const options = { env:{ ...cleanEnv, GIT_AUTHOR_NAME:'Local snapshot', GIT_AUTHOR_EMAIL:'snapshot@localhost', GIT_COMMITTER_NAME:'Local snapshot', GIT_COMMITTER_EMAIL:'snapshot@localhost' } };
     const commit = async (tree, parent) => (await safeGit(directory, ['commit-tree',(await safeGit(directory,['rev-parse',tree + '^{tree}'])).stdout.trim(),...(parent ? ['-p',parent] : []),'-m','Isolated layer (never integrated)'], options)).stdout.trim();
     await regularTree(directory, remoteHead, safeGit);
-    const baseline = await isolatedMerge(directory, originalHead, remoteHead);
+    const baseline = restore ? { head:restore.head } : await isolatedMerge(directory, originalHead, remoteHead);
     await expectedState(directory, body); await noOperation(directory);
     if (baseline.conflict) return baseline;
     await regularTree(directory, baseline.head, safeGit);
@@ -325,14 +356,14 @@ export function createService({ ghPath, env = process.env, command = runCommand,
       const base = await commit(baseTree), local = await commit(localTree, base), incoming = await commit(incomingTree, base);
       return isolatedMerge(directory, originalHead, incoming, local, { remoteHead, layer });
     };
-    const indexResult = await mergeLayer(originalHead, layers.indexTree, baseline.head, 'staged');
+    const indexResult = restore ? baseline : await mergeLayer(originalHead, layers.indexTree, baseline.head, 'staged');
     await expectedState(directory, body); await noOperation(directory);
     if (indexResult.conflict) return indexResult;
-    const workResult = await mergeLayer(layers.indexTree, layers.workTree, indexResult.head, 'worktree');
+    const workResult = restore ? baseline : await mergeLayer(layers.indexTree, layers.workTree, indexResult.head, 'worktree');
     await expectedState(directory, body); await noOperation(directory);
     if (workResult.conflict) return workResult;
     const target = await regularTree(directory, workResult.head, safeGit);
-    const original = await regularTree(directory, layers.workTree, safeGit);
+    const original = restore ? restore.original : await regularTree(directory, layers.workTree, safeGit);
     const targetIndex = await regularTree(directory, indexResult.head, safeGit);
     const tracked = await regularTree(directory, originalHead, safeGit);
     const localIndex = await regularTree(directory, layers.indexTree, safeGit);
@@ -341,13 +372,10 @@ export function createService({ ghPath, env = process.env, command = runCommand,
     for (const path of incoming.keys()) if (!tracked.has(path) && !localIndex.has(path) && original.has(path)) throw new ApiError('Untracked collision prevents safe sync: ' + path, 409);
     const paths = [...new Set([...original.keys(), ...target.keys()])];
     assertDistinctPaths([...paths, ...targetIndex.keys(), ...localIndex.keys(), ...tracked.keys()]);
-    for (const path of paths) {
-      const attrs = (await safeGit(directory,['check-attr','-z','ident','working-tree-encoding','--',path])).stdout.split('\0');
-      for (let i = 0; i + 2 < attrs.length; i += 3) if (!['unspecified','unset'].includes(attrs[i + 2])) throw new ApiError('Safe sync does not support ident or working-tree-encoding conversion; no project files were changed',409);
-    }
+    if (!restore) await checkSyncAttributes(directory, paths, safeGit);
     // Conversion must use the same attribute rules during capture and install.
     // Changing those rules mid-transaction needs a separate, explicit checkout.
-    for (const path of paths) if (path.split('/').at(-1) === '.gitattributes' && original.get(path)?.oid !== target.get(path)?.oid) throw new ApiError('Safe sync cannot change .gitattributes conversion rules; integrate attributes separately before retrying', 409);
+    for (const path of restore ? [] : paths) if (path.split('/').at(-1) === '.gitattributes' && original.get(path)?.oid !== target.get(path)?.oid) throw new ApiError('Safe sync cannot change .gitattributes conversion rules; integrate attributes separately before retrying', 409);
     const changes = [], createdDirectories = [];
     const parent = await realpath(await mkdtemp(join(tmpdir(), 'simple-github-install-')));
     const indexPath = resolve(directory, await out(directory, ['rev-parse','--git-path','index']));
@@ -370,11 +398,13 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         if (before?.oid === after?.oid && before?.mode === after?.mode) continue;
         const info = await pathInfo(directory, path);
         const backup = info ? { bytes:await readFile(join(directory,path)), mode:info.mode & 0o777 } : null;
-        const bytes = after ? (await safeGit(directory, ['cat-file','--filters',`--path=${path}`,after.oid], { encoding:null, maxOutput:64 * 1024 * 1024 })).stdout : null;
+        if (restore && backup && !restore.indexPaths.has(path)) throw new ApiError('Ignored/untracked collision prevents safe restore: ' + path,409);
+        if (!backup && !after) continue;
+        const bytes = after ? (await safeGit(directory, restore ? ['cat-file','blob',after.oid] : ['cat-file','--filters',`--path=${path}`,after.oid], { encoding:null, maxOutput:64 * 1024 * 1024 })).stdout : null;
         const executable = after?.mode === '100755';
         // Preserve private/read-write permission bits; only alter executable bits
         // when the merged Git mode actually changes (or for a new file).
-        const mode = backup ? before?.mode === after?.mode ? backup.mode : (backup.mode & ~0o111) | (executable ? 0o111 : 0) : (executable ? 0o755 : 0o644) & ~process.umask();
+        const mode = backup ? !restore && before?.mode === after?.mode ? backup.mode : (backup.mode & ~0o111) | (executable ? 0o111 : 0) : (executable ? 0o755 : 0o644) & ~process.umask();
         changes.push({ path, backup, bytes, mode, installed:false });
       }
       const indexOptions = { env:{ ...cleanEnv, GIT_INDEX_FILE:join(parent,'index') } };
@@ -483,19 +513,72 @@ export function createService({ ghPath, env = process.env, command = runCommand,
       // Git's builtin text/eol conversion keeps CRLF worktrees out of the
       // synthetic local-edit layer. External clean/process drivers remain off.
       // ident/encoding are not safely reversible for arbitrary local raw bytes.
+      const attributePaths = [];
+      for (const path of paths) if (await pathInfo(directory,path)) attributePaths.push(path);
+      await checkSyncAttributes(directory, attributePaths, safeGit, options);
+      const checkedPaths = new Set(attributePaths), indexUpdates = [];
       for (const path of paths) {
         const info = await pathInfo(directory,path);
-        if (!info) { await safeGit(directory,['update-index','--force-remove','--',path],options); continue; }
-        const attributes = (await safeGit(directory, ['check-attr','-z','ident','working-tree-encoding','--',path])).stdout.split('\0');
-        for (let i = 0; i + 2 < attributes.length; i += 3) if (!['unspecified','unset'].includes(attributes[i + 2])) throw new ApiError('Safe sync does not support ident or working-tree-encoding conversion; no project files were changed',409);
+        if (!info) { indexUpdates.push('0 '+ '0'.repeat(40)+'\t'+path+'\0'); continue; }
+        if (!checkedPaths.has(path)) throw new ApiError('Files changed during batch attribute check; refresh the preview',409);
         const oid = (await safeGit(directory,['hash-object','-w',`--path=${path}`,'--',path])).stdout.trim();
         const roundtrip = (await safeGit(directory, ['cat-file','--filters',`--path=${path}`,oid], {encoding:null,maxOutput:64 * 1024 * 1024})).stdout;
         if (!(await readFile(join(directory,path))).equals(roundtrip)) throw new ApiError('Safe sync cannot round-trip local line endings/conversion without changing raw bytes; normalize or save these files explicitly before retrying: ' + path,409);
         const mode = (!fileMode || process.platform === 'win32') ? indexEntries.get(path)?.mode || '100644' : info.mode & 0o111 ? '100755' : '100644';
-        await safeGit(directory,['update-index','--add','--cacheinfo',mode,oid,path],options);
+        if (!/^[0-9a-f]{40}$/.test(oid)) throw new ApiError('Invalid file object SHA during safe sync',409);
+        indexUpdates.push(mode+' '+oid+'\t'+path+'\0');
       }
+      if (indexUpdates.length) await safeGit(directory,['update-index','-z','--index-info'],{...options,input:indexUpdates.join('')});
       return { indexTree, workTree:(await safeGit(directory,['write-tree'],options)).stdout.trim() };
     } finally { await rm(parent,{recursive:true,force:true}); }
+  }
+  // Source restore never merges a local tree. Capabilities bind the exact local
+  // snapshot, selected ancestor and observed remote head, and are consumed once.
+  const sourceOid = value => { if (!/^[0-9a-f]{40}$/.test(value || '')) throw new ApiError('Invalid source commit SHA'); return value; };
+  async function sourceNetwork(directory, args) {
+    const safeGit = await isolatedCommands(directory);
+    return safeGit(directory, ['-c','credential.helper=','-c',`credential.helper=${await credentialHelper()}`,...args], {timeout:120000});
+  }
+  async function sourceHead(directory) {
+    if (await out(directory,['for-each-ref','--format=%(refname)','refs/replace/'])) throw new ApiError('Replacement objects prevent verified source restore',409);
+    const grafts = resolve(directory,await out(directory,['rev-parse','--git-path','info/grafts']));
+    try { await lstat(grafts); throw new ApiError('Legacy grafts prevent verified remote history',409); } catch(error) { if(error.code !== 'ENOENT') throw error; }
+    await sourceNetwork(directory, ['fetch','--no-tags','origin',fetchRefspec]);
+    return sourceOid(await out(directory,['rev-parse','--verify',`${trackingRef}^{commit}`]));
+  }
+  async function sourcePlan(directory, target) {
+    const safeGit = await isolatedCommands(directory);
+    if ((await out(directory,['rev-parse','--is-shallow-repository'])) === 'true') throw new ApiError('Shallow history prevents safe source restore',409);
+    const entries = (await safeGit(directory,['ls-files','-v','-z'])).stdout.split('\0').filter(Boolean);
+    if (entries.some(entry => entry[0] === 'S' || /^[a-z]/.test(entry))) throw new ApiError('Index skip-worktree/assume-unchanged flags prevent safe restore',409);
+    const parent = await realpath(await mkdtemp(join(tmpdir(),'simple-github-restore-')));
+    try {
+      const options = {env:{...cleanEnv,GIT_INDEX_FILE:join(parent,'index')}};
+      await copyFile(resolve(directory,await out(directory,['rev-parse','--git-path','index'])),join(parent,'index'));
+      const ita = async flag => (await safeGit(directory,['diff','--cached','--name-only','-z','--no-ext-diff','--no-textconv',flag,'--'],options)).stdout;
+      if (await ita('--ita-visible-in-index') !== await ita('--ita-invisible-in-index')) throw new ApiError('Intent-to-add prevents safe restore',409);
+      const indexTree = (await safeGit(directory,['write-tree'],options)).stdout.trim();
+      const index = await regularTree(directory,indexTree,safeGit), tracked = await regularTree(directory,'HEAD',safeGit), desired = await regularTree(directory,target,safeGit);
+      const managed = new Set([...tracked.keys(),...index.keys()]);
+      assertDistinctPaths([...managed,...desired.keys()]);
+      const original = new Map(), changes = []; let bytes = 0;
+      for (const path of [...new Set([...managed,...desired.keys()])].sort()) {
+        const info = await pathInfo(directory,path);
+        if (info && (!managed.has(path) || !index.has(path))) throw new ApiError('Ignored/untracked collision prevents safe restore: ' + path,409);
+        if (info) { bytes += info.size; if(bytes > 64 * 1024 * 1024) throw new ApiError('Restore exceeds 64MB safety budget'); }
+        // A sentinel forces raw overwrite even if HEAD/index objects match: the
+        // actual worktree may contain explicitly confirmed broken local edits.
+        if (managed.has(path)) original.set(path,{oid:'local-overwrite',mode:index.get(path)?.mode || tracked.get(path)?.mode});
+        if (managed.has(path) || desired.has(path)) changes.push({path,status:desired.has(path) ? managed.has(path) ? 'M' : 'A' : 'D'});
+      }
+      let targetBytes = 0;
+      for (const entry of desired.values()) { targetBytes += Number((await safeGit(directory,['cat-file','-s',entry.oid])).stdout.trim()); if(targetBytes > 64 * 1024 * 1024) throw new ApiError('Restore target exceeds 64MB safety budget'); }
+      return {indexTree,indexPaths:new Set(index.keys()),original,changes};
+    } finally { if(await realpath(parent) !== parent) throw new ApiError('Unsafe restore cleanup path',500); await rm(parent,{recursive:true,force:true}); }
+  }
+  async function sourceAncestor(directory, target, head) {
+    try { await (await isolatedCommands(directory))(directory,['merge-base','--is-ancestor',sourceOid(target),sourceOid(head)]); }
+    catch { throw new ApiError('Target is not reachable from the configured remote branch',409); }
   }
   const deployment = deploymentFactory({ inspect, redact });
   async function route(name, body = {}, query = new URLSearchParams()) {
@@ -574,6 +657,65 @@ export function createService({ ghPath, env = process.env, command = runCommand,
         })();
         return { id, directory, state:'running' };
       }
+      case 'source-history': return locked(body.directory, async directory => {
+        const context = await remoteContext(directory); requireDev(context); await noOperation(directory);
+        const page = body.page ?? 1, pageSize = body.pageSize ?? 20;
+        if (!Number.isSafeInteger(page) || page < 1 || page > 10000 || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 50) throw new ApiError('Invalid history pagination');
+        const remoteHead = await sourceHead(directory);
+        if (page > 1 && !body.remoteHead || body.remoteHead !== undefined && sourceOid(body.remoteHead) !== remoteHead) throw new ApiError('Remote history changed; refresh from page one',409);
+        if ((await out(directory,['rev-parse','--is-shallow-repository'])) === 'true') throw new ApiError('Shallow history is incomplete; use a full clone for source history',409);
+        const safeGit = await isolatedCommands(directory);
+        const rows = (await safeGit(directory,['log','--topo-order',`--skip=${(page-1)*pageSize}`,`--max-count=${pageSize+1}`,'--format=%H%x00%s%x00%an%x00%aI%x00',remoteHead,'--'])).stdout.split('\0');
+        const commits=[];
+        for(let i=0;i+3<rows.length;i+=4) commits.push({sha:sourceOid(rows[i].trim()),subject:redact(rows[i+1]),author:redact(rows[i+2]),date:rows[i+3]});
+        return {commits:commits.slice(0,pageSize),remoteHead,page,pageSize,hasMore:commits.length>pageSize};
+      });
+      case 'source-restore-preview': return locked(body.directory, async directory => {
+        const context = await remoteContext(directory), current = await expectedState(directory,body); requireDev(current); await noOperation(directory);
+        if (context.head !== current.head || context.fingerprint !== current.fingerprint) throw new ApiError('Repository changed during identity verification',409);
+        const target = sourceOid(body.target), remoteHead = sourceOid(body.remoteHead);
+        if (await sourceHead(directory) !== remoteHead) throw new ApiError('Remote branch changed; refresh history',409);
+        await sourceAncestor(directory,target,remoteHead);
+        const plan = await sourcePlan(directory,target);
+        await expectedState(directory,body); await noOperation(directory);
+        const previewId = randomBytes(32).toString('hex'), expiresAt = Date.now()+5*60*1000;
+        restorePreviews.set(previewId,{directory,target,remoteHead,expected:snapshot(current),expiresAt});
+        while(restorePreviews.size>20) restorePreviews.delete(restorePreviews.keys().next().value);
+        const safeGit = await isolatedCommands(directory);
+        const diff = (await safeGit(directory,['diff','--name-status','--no-renames','--no-ext-diff','--no-textconv','-z',remoteHead,target,'--'])).stdout.split('\0');
+        const changes=[]; for(let i=0;i+1<diff.length;i+=2) if(diff[i]) changes.push({status:diff[i],path:safePath(diff[i+1])});
+        return {previewId,target,remoteHead,expiresAt,repository:current.repository,branch,changes,localOverwriteChanges:plan.changes,localChanges:current.changes};
+      });
+      case 'source-restore': return locked(body.directory, async directory => {
+        if (body.confirmedOverwrite !== true) throw new ApiError('Explicit confirmedOverwrite true is required',409);
+        const saved = restorePreviews.get(body.previewId);
+        if (!saved || saved.directory !== directory || saved.expiresAt < Date.now()) throw new ApiError('Unknown or expired restore preview; preview again',409);
+        restorePreviews.delete(body.previewId);
+        const context = await remoteContext(directory), current = await expectedState(directory,saved.expected); requireDev(current); await noOperation(directory);
+        if (context.head !== current.head || context.fingerprint !== current.fingerprint) throw new ApiError('Repository changed during identity verification',409);
+        if (await sourceHead(directory) !== saved.remoteHead) throw new ApiError('Remote branch changed; restore refused without merging',409);
+        await sourceAncestor(directory,saved.target,saved.remoteHead);
+        const plan = await sourcePlan(directory,saved.target), safeGit = await isolatedCommands(directory);
+        const tree = (await safeGit(directory,['rev-parse',saved.target+'^{tree}'])).stdout.trim();
+        const head = sourceOid((await safeGit(directory,['commit-tree',tree,'-p',saved.remoteHead,'-m',`Restore source from ${saved.target} by ${context.actor}`],{env:{...cleanEnv,GIT_AUTHOR_NAME:'Source restore',GIT_AUTHOR_EMAIL:'source-restore@localhost',GIT_COMMITTER_NAME:'Source restore',GIT_COMMITTER_EMAIL:'source-restore@localhost'}})).stdout.trim());
+        if ((await safeGit(directory,['rev-parse',head+'^{tree}'])).stdout.trim() !== tree || (await safeGit(directory,['rev-list','--parents','-n','1',head])).stdout.trim() !== `${head} ${saved.remoteHead}`) throw new ApiError('Restore commit verification failed',500);
+        await expectedState(directory,saved.expected); await noOperation(directory);
+        if (await sourceHead(directory) !== saved.remoteHead) throw new ApiError('Remote branch changed; restore refused without merging',409);
+        await expectedState(directory,saved.expected); await noOperation(directory);
+        let pushError;
+        try { await sourceNetwork(directory,['push','origin',`${head}:${localRef}`]); } catch(error) { pushError=error; }
+        let remoteHead=null;
+        try { remoteHead=await sourceHead(directory); } catch {}
+        const result = {head,target:saved.target,remoteHead};
+        if (remoteHead !== head) return {...result,ok:false,needsAction:true,remoteUpdated:remoteHead === saved.remoteHead ? false : null,localUpdated:false,localState:'unchanged',message:remoteHead === null ? '推送结果不确定；本地未覆盖。请先核实远程分支，禁止盲目重试或强推。' : '远程未处于恢复提交（可能推送失败或已有并发更新）；本地未覆盖。请刷新历史重新确认。',...(pushError ? {detail:redact(pushError.message)} : {})};
+        try {
+          await expectedState(directory,saved.expected); await noOperation(directory);
+          await layeredSync(directory,current,saved.expected,head,{indexTree:plan.indexTree},{head,original:plan.original,indexPaths:plan.indexPaths});
+          return {...result,ok:true,remoteUpdated:true,localUpdated:true};
+        } catch(error) {
+          return {...result,ok:false,needsAction:true,remoteUpdated:true,localUpdated:false,localState:'inspect-required',message:'远程恢复提交已成功；本地覆盖未完成。请检查本地状态并重新预览该远程恢复提交后重试。远程与本地不是原子事务。详情：'+redact(error.message)};
+        }
+      });
       case 'inspect': return inspect(body.directory);
       case 'diff': {
         const directory = await root(body.directory); const options = { maxOutput: 256 * 1024, truncate: true };
@@ -678,7 +820,7 @@ export function createService({ ghPath, env = process.env, command = runCommand,
       default: throw new ApiError('Not found', 404);
     }
   }
-  return { csrfToken, route, inspect, getConflictReport, close() { if (hooksPromise) void hooksPromise.then(path => rmdir(path)).catch(() => {}); conflictReports.clear(); deployment.close(); for (const c of controllers) c.abort(); }, tokenMatches(value) { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) && timingSafeEqual(Buffer.from(value), Buffer.from(csrfToken)); } };
+  return { csrfToken, route, inspect, getConflictReport, close() { if (hooksPromise) void hooksPromise.then(path => rmdir(path)).catch(() => {}); conflictReports.clear(); restorePreviews.clear(); deployment.close(); for (const c of controllers) c.abort(); }, tokenMatches(value) { return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value) && timingSafeEqual(Buffer.from(value), Buffer.from(csrfToken)); } };
 }
 
 export function checkRequest(req, { port, csrfVerified = false } = {}) {

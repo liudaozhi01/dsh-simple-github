@@ -247,6 +247,16 @@ class Broker:
             with BUILD.open('rb') as src, (stage / 'build.py').open('xb') as dst:
                 shutil.copyfileobj(src, dst)
             (stage / 'build.py').chmod(0o600)
+            # Legacy OA database automation uses installed, reviewed helpers only.
+            # Other project namespaces retain their existing release contract.
+            if PROJECT_ID is None:
+                for installed, staged in (('xian-oa-test-database.py', 'database.py'),
+                                          ('xian-oa-test-schema-plan.py', 'schema-plan.py')):
+                    helper = ENGINE.parent / installed
+                    private(helper)
+                    with helper.open('rb') as src, (stage / staged).open('xb') as dst:
+                        shutil.copyfileobj(src, dst)
+                    (stage / staged).chmod(0o600)
             if request['action'] == 'start':
                 if environment == 'dev' and self.record('plan', body['planId']).get('operation') != 'restore':
                     require('bundle' in body, 'Dev requires bundle')

@@ -93,6 +93,16 @@ class Tests(unittest.TestCase):
   with patch.object(self.r,'observe',side_effect=m.Refused('Expected one existing container per service')),patch.object(self.r,'compose',return_value='a'*64),patch.object(self.r,'run',side_effect=run):
    with self.assertRaisesRegex(m.Refused,'Preflight service failure') as caught:self.plan()
   self.assertIn(message,str(caught.exception));self.assertNotIn('secret',str(caught.exception));self.assertEqual(list(self.r.state.glob('job-*')),[])
+ def test_admin_conflict_is_allowlisted(self):
+  message='预设超管初始化冲突：admin账号已绑定其他人员，请人工核对，不会自动换绑'
+  self.assertEqual(m.failure_details('password=secret\njava.lang.IllegalStateException: '+message),[message])
+ def test_existing_failure_enriched_readonly(self):
+  message='预设超管初始化冲突：admin账号已绑定其他人员，请人工核对，不会自动换绑'
+  job={'status':'uncertain','stage':'applying','images':IM,'createdAt':1,'errorDetails':['dependency failed to start: container example-dev-api-1 is unhealthy']}
+  original=json.dumps(job)
+  with patch.object(self.r,'deployment_failure_details',return_value=[message]),patch.object(self.r,'activity',return_value={'state':'unknown'}):
+   public=self.r.observed_public_job(job)
+  self.assertIn(message,public['errorSummary']);self.assertEqual(json.dumps(job),original)
  def test_safe_structural_diagnostics(self):
   message="Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible."
   raw='password=secret SELECT confidential FROM payroll\nCaused by: java.sql.SQLException: '+message+'\nAuthorization: Bearer hidden'
@@ -120,7 +130,7 @@ class Tests(unittest.TestCase):
    job=self.work(self.start(self.plan()))
   self.assertEqual(job['status'],'uncertain');self.assertEqual(job['errorDetails'],[message]);self.assertIn(message,m.Release.public_job(job)['errorSummary'])
   with patch.object(self.r,'compose',side_effect=RuntimeError('password=secret')):
-   self.assertEqual(self.r.deployment_failure_details(job),[])
+   self.assertEqual(self.r.deployment_failure_details(job),[message])
  def test_legacy_job_safe_fallback(self):
   public=m.Release.public_job({'status':'uncertain','stage':'applying','createdAt':1,'error':'password=secret'})
   self.assertIn('未提取到',public['errorSummary']);self.assertNotIn('secret',json.dumps(public))
@@ -169,7 +179,7 @@ class Tests(unittest.TestCase):
  def test_build_failure_does_not_apply(self):
   self.r.fail='build';self.assertEqual(self.work(self.start(self.plan()))['status'],'failed');self.assertFalse(any(c[0]=='compose' for c in self.r.calls))
  def test_apply_uncertain_no_replay(self):
-  self.r.fail='up';j=self.start(self.plan());self.assertEqual(self.work(j)['status'],'uncertain');n=len(self.r.calls);self.assertTrue(self.r.reconcile({'jobId':j['jobId']})['readOnly']);self.assertEqual(len(self.r.calls),n)
+  self.r.fail='up';j=self.start(self.plan());self.assertEqual(self.work(j)['status'],'uncertain');n=len(self.r.calls);self.assertTrue(self.r.reconcile({'jobId':j['jobId']})['readOnly']);self.assertTrue(all(c[0]=='compose' and c[2][:3]==['ps','-a','-q'] for c in self.r.calls[n:]))
   with self.assertRaises(m.Refused):self.r.accept({'jobId':j['jobId'],'confirmation':True})
   with self.assertRaises(m.Refused):self.start(self.plan())
  def test_drift_and_db_identity(self):
@@ -244,11 +254,88 @@ class Tests(unittest.TestCase):
    self.r.put('job',J,{'jobId':J,'environment':'dev','status':status,'images':IM,'head':H})
    with self.assertRaises(m.Refused):self.r.promote({'releaseId':J})
 
+class DatabaseTests(unittest.TestCase):
+ setUp=Tests.setUp
+ tearDown=Tests.tearDown
+ start=Tests.start
+ work=Tests.work
+ def database_run(self, fail_apply=False, fail_restore=False, fail_backup=False):
+  from types import SimpleNamespace
+  r=self.r;events=[]
+  class DB:
+   progress=None
+   def snapshot(self):return {'schema':'bound'}
+   def backup(self,key):
+    events.append('backup')
+    if fail_backup:raise RuntimeError('backup')
+    return {'id':'backup','createdAt':1,'path':'private-secret'}
+   def apply(self,sql):
+    events.append('apply')
+    if fail_apply:raise RuntimeError('ddl')
+   def restore(self,backup):
+    events.append('restore')
+    if fail_restore:raise RuntimeError('restore')
+  db=DB()
+  r.database_enabled=lambda:True;r.database=lambda e:db
+  r.observe=lambda e:healthy(IM if e=='dev' else r.images)
+  r.database_helper=lambda name:SimpleNamespace(plan_schema=lambda a,b:[] if 'apply' in events else ['ALTER'])
+  r.put('job',J,{'jobId':J,'environment':'dev','status':'ready','head':H,'images':IM,'databaseSchema':{'schema':'bound'},'actor':'operator','createdAt':1})
+  p=r.promote({'releaseId':J});j=self.start(p)
+  original=r.compose
+  def compose(e,args,images=None,override=False):
+   if args[0]=='stop':events.append('stop');return ''
+   return original(e,args,images,override)
+  r.compose=compose
+  result=self.work(j)
+  return result,events
+ def test_test_schema_repair_allows_unhealthy_apps_but_requires_healthy_db(self):
+  r=self.r;r.database_enabled=lambda:True
+  observation=healthy();observation['api']['healthy']=False;observation['web']['healthy']=False
+  r.observe=lambda e:observation
+  self.assertIn('planId',r.plan('a'*32,'test',H,IM,J))
+  with self.assertRaises(m.Refused):r.plan('c'*32,'dev',H)
+  with self.assertRaises(m.Refused):r.plan('d'*32,'test',H)
+  observation['db']['healthy']=False
+  with self.assertRaises(m.Refused):r.plan('e'*32,'test',H,IM,J)
+ def test_legacy_dev_snapshot_binds_only_live_matching_healthy_images(self):
+  from types import SimpleNamespace
+  r=self.r;r.database_enabled=lambda:True
+  r.database=lambda e:SimpleNamespace(snapshot=lambda:{'tables':{}})
+  r.database_helper=lambda name:SimpleNamespace(plan_schema=lambda a,b:[])
+  r.observe=lambda e:healthy(IM if e=='dev' else OLD)
+  source={'jobId':J,'environment':'dev','status':'ready','head':H,'images':IM,'actor':'operator','createdAt':1}
+  r.put('job',J,source);p=r.promote({'releaseId':J})
+  self.assertEqual(r.get('plan',p['planId'])['databaseSchemaOrigin'],'live-healthy-legacy-dev')
+  self.assertNotIn('databaseSchema',r.get('job',J))
+  r.observe=lambda e:healthy(OLD)
+  with self.assertRaisesRegex(m.Refused,'Dev images changed'):r.promote({'releaseId':J})
+ def test_database_success(self):
+  job,events=self.database_run();self.assertEqual(events,['stop','backup','apply']);self.assertEqual(job['status'],'ready')
+  self.assertNotIn('private-secret',json.dumps(self.r.public_job(job)))
+ def test_database_ddl_failure_restores_before_return(self):
+  job,events=self.database_run(fail_apply=True);self.assertEqual(events,['stop','backup','apply','stop','restore']);self.assertEqual(job['stage'],'db-restored');self.assertEqual(job['status'],'failed')
+  self.assertIn('本次发布失败',self.r.public_job(job)['errorSummary'])
+ def test_database_restore_failure_is_uncertain(self):
+  job,events=self.database_run(fail_apply=True,fail_restore=True);self.assertEqual(job['stage'],'db-restore-failed');self.assertEqual(job['status'],'uncertain')
+  self.assertIn('禁止重复发布',self.r.public_job(job)['errorSummary'])
+ def test_database_backup_failure_never_migrates(self):
+  job,events=self.database_run(fail_backup=True);self.assertEqual(events,['stop','backup']);self.assertEqual(job['status'],'failed')
+
+ def test_database_rejects_image_only_restore(self):
+  self.r.database_enabled=lambda:True
+  self.r.put('job',J,{'jobId':J,'environment':'test','status':'ready','head':H,'images':IM,'actor':'operator','createdAt':1})
+  with self.assertRaises(m.Refused):self.r.restore({'jobId':J,'environment':'test'})
+
+ def test_database_failed_recovery_blocks_future_plans(self):
+  self.r.database_enabled=lambda:True
+  self.r.put('job',J,{'jobId':J,'environment':'test','status':'uncertain','stage':'db-restore-failed'})
+  with self.assertRaisesRegex(m.Refused,'manual recovery required'):self.r.plan('f'*32,'test',H)
+
 unittest.main(argv=['fixture'],verbosity=2)
 `;
 test('temporary release isolated Python state machine, archive and lifecycle fixtures', () => {
   const result = spawnSync('python3', ['-I', '-B', '-c', fixture, source], { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.match(result.stderr, /Ran 33 tests/);
+  assert.match(result.stderr, /Ran 43 tests/);
 });

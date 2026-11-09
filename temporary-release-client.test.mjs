@@ -85,6 +85,14 @@ test('known preflight refusals survive transport and client without leaking stde
     }
   }
 });
+test('schema structural refusal survives JSON transport and repeated sanitization', async () => {
+  const reason='SCHEMA_REVIEW_V1:'+JSON.stringify({force:false,details:[{code:'COLUMN_TYPE_MISMATCH',reason:'password=secret',table:'org_employee',column:'id',fromType:'varchar(36)',toType:'bigint'}]});
+  const p=profile();
+  const transport=createTemporaryReleaseTransport({port:1,script:'pass',bridge:async path=>path==='/api/dsh-ssh/hosts'?{hosts:[{...p.target,auth:'key',proxyJump:[]}]}:{result:{exitCode:1,stdout:JSON.stringify({error:reason}),stderr:''}}});
+  const f=fixture('刘道志',{transport});
+  await assert.rejects(f.client.check(),error=>/org_employee.id/.test(error.message)&&/test varchar\(36\) → dev bigint/.test(error.message)&&!error.message.includes('secret'));
+  transport.close();
+});
 test('unknown transport failures remain private and uncertain', async () => {
   const f = fixture('刘道志', { transport: async () => { throw Error('password=secret'); } });
   await assert.rejects(f.client.check(), error => /未明确响应/.test(error.message) && !error.message.includes('secret'));

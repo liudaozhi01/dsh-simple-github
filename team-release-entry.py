@@ -33,6 +33,33 @@ def installed_project_id():
     return match.group(1)
 
 
+def validate_request(data):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Duplicate request field')
+            result[key] = value
+        return result
+    request = json.loads(data, object_pairs_hook=unique)
+    actions = {
+        'check': ({'head'}, {'head'}),
+        'promote': ({'releaseId'}, {'releaseId'}),
+        'restore': ({'environment', 'jobId'}, {'environment', 'jobId'}),
+        'start': ({'planId', 'confirmation', 'databaseRiskAccepted', 'bundle'}, {'planId', 'confirmation', 'databaseRiskAccepted'}),
+        'overview': (set(), set()), 'status': ({'jobId'}, set()),
+        'accept': ({'jobId', 'confirmation'}, {'jobId', 'confirmation'}),
+        'reconcile': ({'jobId'}, {'jobId'}),
+    }
+    if type(request) is not dict or set(request) != {'action', 'body'} or type(request['action']) is not str or request['action'] not in actions or type(request['body']) is not dict:
+        raise ValueError('Invalid action/body')
+    allowed, required = actions[request['action']]
+    body = request['body']
+    if not set(body) <= allowed or not required <= set(body):
+        raise ValueError('Invalid action fields')
+    return request
+
+
 def main():
     try:
         project_id = installed_project_id()
@@ -42,7 +69,7 @@ def main():
         data = base64.b64decode(sys.argv[1], validate=True)
         if not data or len(data) > MAX_REQUEST:
             raise ValueError()
-        # Broker performs strict JSON/schema parsing. Never import writable code.
+        validate_request(data)  # Broker independently revalidates. Never import writable code.
         metadata = os.lstat(endpoint)
         if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) not in (0o660, 0o666):
             raise ValueError()

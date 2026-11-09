@@ -135,6 +135,27 @@ function devService({ defaultBranch = 'main', fetch = async () => {}, push = asy
   };
   return {service:createService({ghPath:'mock-gh',command}),calls};
 }
+for (const scenario of ['tls','reset','auth','certificate','invalid-json','mismatch','missing-default','rest-failure']) test('repository metadata network fallback: '+scenario,async()=>{
+ const {directory,git}=await fixture(),calls=[];
+ await git(['checkout','-b','dev']);
+ const service=createService({ghPath:'mock-gh',command:async(cmd,args,opts)=>{
+  if(cmd!=='mock-gh'){if(args.includes('fetch'))throw new Error('fixture metadata verified before fetch');return runCommand(cmd,args,opts);}
+  calls.push(args);
+  if(args[0]==='api'&&args[1]==='user')return {stdout:JSON.stringify({login:'fixture'})};
+  if(args[0]==='repo'){
+   if(scenario==='invalid-json')return {stdout:'not JSON'};
+   throw new Error(scenario==='auth'?'HTTP 403: forbidden':scenario==='certificate'?'x509: certificate signed by unknown authority':scenario==='reset'?'connection reset by peer':'Post "https://api.github.com/graphql": net/http: TLS handshake timeout');
+  }
+  assert.deepEqual(args,['api',`repos/${FIXED_REPOSITORY}`,'--hostname','github.com','--method','GET']);assert.equal(opts.timeout,30000);
+  if(scenario==='rest-failure')throw new Error('REST network unreachable');
+  return {stdout:JSON.stringify({full_name:scenario==='mismatch'?'other/repo':FIXED_REPOSITORY,default_branch:scenario==='missing-default'?null:'main'})};
+ }});
+ try {
+  const pattern=['tls','reset'].includes(scenario)?/fixture metadata verified before fetch/:['mismatch','missing-default'].includes(scenario)?/Unable to verify/:scenario==='rest-failure'?/REST network unreachable/:scenario==='invalid-json'?/JSON/:scenario==='auth'?/HTTP 403/:/certificate/;
+  await assert.rejects(service.route('sync-dev',{directory,...expected(await service.inspect(directory))}),pattern);
+  assert.equal(calls.filter(a=>a[1]===`repos/${FIXED_REPOSITORY}`).length,['auth','certificate','invalid-json'].includes(scenario)?0:1);
+ }finally{service.close();}
+});
 function request(overrides = {}) { return { method: 'POST', headers: { host: '127.0.0.1:12345', origin: 'http://127.0.0.1:12345' }, socket: { remoteAddress: '127.0.0.1', localPort: 12345 }, ...overrides }; }
 test('request security rejects non-loopback, DNS rebinding, cross origins and absent mutation Origin', () => {
   checkRequest(request()); checkRequest(request({ method: 'GET', headers: { host: 'localhost:12345' } }));

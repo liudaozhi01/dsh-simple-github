@@ -38,7 +38,7 @@ test('navigation changes visible sections without API calls and preserves projec
  const sections=()=>all(root).filter(n=>n.tagName==='section'&&!n.hidden).map(n=>n.attributes['data-view']);
  assert.deepEqual(sections(),['project','project']);const field=all(root).find(n=>n.sgDraftKey==='project-directory');field.value='/draft';field.oninput();
  const before=calls.length;const select=view=>all(root).find(n=>n.tagName==='nav').children.find(n=>n.textContent===view).onclick();
- select('设置');assert.deepEqual(sections(),['settings','settings']);
+ select('设置');assert.deepEqual(sections(),['settings','settings','settings']);
  select('项目');assert.equal(all(root).filter(n=>n.tagName==='section'&&!n.hidden)[0].children[0].textContent,'开发环境初始化');assert.ok(!all(root).some(n=>n.tagName==='button'&&n.textContent==='本地环境'));select('代码同步');assert.deepEqual(sections(),[]);assert.ok(all(root).some(n=>n.textContent==='先打开一个项目'));
  select('项目');assert.equal(all(root).find(n=>n.sgDraftKey==='project-directory').value,'/draft');assert.equal(calls.length,before);
  }finally{dispose?.();Object.assign(globalThis,old);}

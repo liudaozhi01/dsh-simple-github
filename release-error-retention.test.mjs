@@ -76,10 +76,12 @@ test('first publish with no historical job still exposes retained diagnostics',(
  await click('复制排查信息');assert.equal(JSON.parse(copies.at(-1)).submissionError,originalError);
 }));
 
-for(const [activity,label] of [[{state:'active'},'张三正在发布 · 服务器编译'],[{state:'interrupted'},'上次发布已中断，待核对'],[{state:'unknown'},'暂时无法确认发布活动，请核对'],[undefined,'任务记录未完成，尚未核验是否仍在发布']]){
+for(const [activity,label] of [[{state:'active'},'张三正在发布 · 服务器编译'],[{state:'interrupted'},'上次发布已中断，待核对'],[{state:'unknown'},'服务器记录：服务器编译'],[undefined,'服务器记录：服务器编译']]){
  test('release activity label '+(activity?.state||'legacy'),()=>fixture({initialJobs:[{...oldJob,status:'running',stage:'building',actor:'张三',activity}]},async({root,node,calls})=>{
   assert.ok(all(root).some(n=>n.textContent==='dev · '+label));assert.equal(node('发布 dev').disabled,true);
   if(activity?.state!=='active')assert.ok(!all(root).some(n=>n.textContent==='发布阶段'));
+   if(activity?.state==='unknown')assert.ok(all(root).some(n=>n.textContent.includes('进程活动暂时无法确认')));
+   if(!activity)assert.ok(all(root).some(n=>n.textContent.includes('当前服务器暂不支持进程活动核验')));
   assert.ok(!calls.some(c=>c.url.endsWith('/docker-start')));
  }));
 }

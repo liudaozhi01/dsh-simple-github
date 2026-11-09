@@ -28,6 +28,18 @@ function fixture({ team = true } = {}) {
   } });
   return { client, calls, sources, cleaned: () => cleaned, overview(value) { overview = value; } };
 }
+test('uncertain root cause survives missing activity and blocks every source operation', async () => {
+  const reason = '预设超管初始化冲突：admin账号已绑定其他人员，请人工核对，不会自动换绑';
+  for (const activity of [undefined, { state: 'unknown' }, { state: 'interrupted' }]) {
+    const f = fixture();
+    const entry = { ...job('dev', 'uncertain'), errorSummary: 'password=secret ' + reason, errorDetails: [reason], ...(activity ? { activity } : {}) };
+    f.overview({ jobs: [entry] });
+    await assert.rejects(f.client.check(), e => e.status === 409 && e.message.includes(reason) && e.message.includes('本次发布尚未启动') && !e.message.includes('secret') && !e.message.includes('升级'));
+    assert.deepEqual(f.sources, []);
+    assert.deepEqual(f.calls.map(c => c.action), ['overview']);
+    f.client.close();
+  }
+});
 const conflict = error => error.status === 409 && /任务记录未完成，服务器尚未提供活动核验，请核对\/升级/.test(error.message);
 const knownConflict = error => error.status === 409 && /旧的未解决发布任务阻止新部署/.test(error.message);
 const job = (environment, status) => ({ jobId: 'old-job', environment, status });
