@@ -32,6 +32,9 @@ class Release:
    value=self.containers[a[-1]].copy()
    if self.fail=='identity':value={**value,'Config':{'Labels':{}}}
    return json.dumps([value])
+  if a[:2]==['start','--attach'] and self.fail=='attach':
+   self.last_failure_details=['src/Example.java:[1,2] error: cannot find symbol']
+   raise RuntimeError('attached build failed')
   if a[0]=='wait':
    if self.fail=='timeout':raise RuntimeError('timeout')
    return '1' if self.fail in ('tests','compile') else '0'
@@ -68,12 +71,23 @@ class Tests(unittest.TestCase):
   self.assertFalse((work/'web/backend').exists());self.assertFalse((work/'web/docs').exists())
   self.assertEqual([a[-1] for a,e,t in self.r.calls if a[0]=='rm'],[format(2,'064x'),format(1,'064x')])
   self.assertFalse(any('prune' in a for a,e,t in self.r.calls))
+ def test_frontend_keeps_only_shared_public_region_dictionary(self):
+  resources=self.repo/'backend/src/main/resources';resources.mkdir(parents=True)
+  (resources/'oa-regions.json').write_text('[{"label":"region"}]')
+  (resources/'application.yml').write_text('secret: never-copy')
+  self.build()
+  work=next(self.r.stage.iterdir());front=work/'web'
+  self.assertEqual((front/'backend/src/main/resources/oa-regions.json').read_text(),'[{"label":"region"}]')
+  self.assertFalse((front/'backend/pom.xml').exists())
+  self.assertFalse((front/'backend/src/main/resources/application.yml').exists())
+  self.assertNotIn('backend', (front/'.dockerignore').read_text().splitlines())
  def test_default_packages_without_mysql_and_cleans_only_builder(self):
   self.assertEqual(set(self.build()),{'api','web'})
   creates=[(a,e) for a,e,t in self.r.calls if a[0]=='create'];self.assertEqual(len(creates),1)
   runner,env=creates[0];self.assertIsNone(env)
   self.assertEqual(runner[runner.index('--network')+1],'bridge')
   self.assertIn('-DskipTests package',runner[-1]);self.assertNotIn('maven.test.skip',runner[-1])
+  self.assertTrue(any(a[:2]==['start','--attach'] and t==3600 for a,e,t in self.r.calls))
   self.assertFalse(any('MYSQL' in ' '.join(a) or 'ALLOW_CREATE_DATABASE' in ' '.join(a) for a,e,t in self.r.calls))
   self.assertTrue(all(e is None for a,e,t in self.r.calls))
   self.assertFalse(any(a[0]=='exec' for a,e,t in self.r.calls))
@@ -91,6 +105,12 @@ class Tests(unittest.TestCase):
   self.assertFalse(any(a[0]=='cp' for a,e,t in self.r.calls))
   self.assertEqual(len([1 for a,e,t in self.r.calls if a[0]=='build']),1)
   self.assertFalse(any('MYSQL' in ' '.join(a) for a,e,t in self.r.calls))
+ def test_attached_failure_preserves_diagnostics_and_cleans_builder(self):
+  self.r.fail='attach'
+  with self.assertRaisesRegex(RuntimeError,'attached build failed'):self.build()
+  self.assertEqual(self.r.last_failure_details,['src/Example.java:[1,2] error: cannot find symbol'])
+  self.assertEqual([a[-1] for a,e,t in self.r.calls if a[0]=='rm'],[format(1,'064x')])
+  self.assertFalse(any(a[0]=='cp' and ':/out/app.jar' in a[1] for a,e,t in self.r.calls))
  def test_failed_tests_fail_closed_and_cleanup(self):
   self.r.fail='tests'
   with self.assertRaisesRegex(RuntimeError,'tests failed'):self.build(run_tests=True)
@@ -129,5 +149,5 @@ unittest.main(argv=['fixture'])
 test('broker build: default skipTests, opt-in MySQL, cache layers and fail-closed cleanup', () => {
   const p = spawnSync('python3', ['-I', '-c', fixture, source], { encoding: 'utf8', timeout: 30000 });
   assert.equal(p.status, 0, `${p.stdout}\n${p.stderr}`);
-  assert.match(p.stderr, /Ran 11 tests/);
+  assert.match(p.stderr, /Ran 13 tests/);
 });

@@ -158,7 +158,21 @@ def build(release, repo, head, job_id, mysql_image, run_tests=False):
                           + ('' if run_tests else '-DskipTests ') + 'package; '
                           'set -- target/*.jar; test "$#" -eq 1; test -f "$1"; cp "$1" /out/app.jar'],
                          test_env)
-        run(['start', builder])
+        # Attach while executing: log-driver=none intentionally persists no Docker
+        # logs, so detached start/wait would discard the actual Maven diagnostics.
+        try:
+            run(['start', '--attach', builder], 3600)
+        except Exception:
+            primary = list(getattr(release, 'last_failure_details', []))
+            if run_tests:
+                try:
+                    diagnostics = Path(getattr(release, 'state', release.stage)) / ('test-reports-' + job_id)
+                    diagnostics.mkdir(mode=0o700, exist_ok=True)
+                    run(['cp', builder + ':/work/target/surefire-reports/.', str(diagnostics)])
+                except Exception:
+                    pass
+            release.last_failure_details = primary
+            raise
         status = run(['wait', builder], 3600).strip()
         if status != '0' and run_tests:
             # Preserve test diagnostics only in root-owned state, never the member response.
@@ -180,7 +194,14 @@ def build(release, repo, head, job_id, mysql_image, run_tests=False):
                        'USER 10001:10001\nENTRYPOINT ["java","-jar","/app/app.jar"]\n', 'api')
         frontend = work / 'web'
         _copy(repo, frontend, frontend=True)
-        (frontend / '.dockerignore').write_text('backend\n.github\ndocs\n.git\n**/node_modules\n**/target\ndist\n')
+        # The frontend shares this public region dictionary with the backend.
+        # Copy only this reviewed data file, never backend code/config/secrets.
+        regions = repo / 'backend/src/main/resources/oa-regions.json'
+        if regions.is_file():
+            target = frontend / 'backend/src/main/resources/oa-regions.json'
+            target.parent.mkdir(parents=True)
+            shutil.copyfile(regions, target)
+        (frontend / '.dockerignore').write_text('.github\ndocs\n.git\n**/node_modules\n**/target\ndist\n')
         web_id = image(frontend, 'FROM ' + bases['node'] + ' AS build\nWORKDIR /src\n'
                        'COPY package*.json ./\nRUN npm ci\nCOPY . .\nRUN npm run build\n'
                        'FROM ' + bases['nginx'] + '\nLABEL org.opencontainers.image.revision="' + head + '"\n'
@@ -191,6 +212,7 @@ def build(release, repo, head, job_id, mysql_image, run_tests=False):
     finally:
         # Re-check full immutable ID + per-attempt label before every destruction.
         # Cleanup failure fails closed too; never select by names or broad labels.
+        primary_details = list(getattr(release, 'last_failure_details', []))
         failed = False
         for cid in reversed(containers):
             try:
@@ -198,4 +220,6 @@ def build(release, repo, head, job_id, mysql_image, run_tests=False):
                 run(['rm', '--force', '--volumes', cid], 60)
             except Exception:
                 failed = True
+        if primary_details:
+            release.last_failure_details = primary_details
         require(not failed, 'Build cleanup incomplete; operator inspection required')

@@ -39,7 +39,27 @@ def failure_details(text):
         r'dependency failed to start: container [A-Za-z0-9_.-]+ is unhealthy',
         r'Bind for (?:[0-9.]+:)?[0-9]+ failed: port is already allocated',
     )
-    return list(dict.fromkeys(match.group(0) for pattern in patterns for match in re.finditer(pattern, text)))[:4]
+    # Build logs can echo source, command arguments, registry URLs and secrets.
+    # Keep only constrained locations/codes and fixed descriptions, not messages.
+    text = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', text)
+    details = [match.group(0) for pattern in patterns for match in re.finditer(pattern, text)]
+    path = r'(?:[A-Za-z0-9_-]{1,80}/){0,20}[A-Za-z0-9_.-]{1,100}'
+    ts_descriptions = {'2307': 'Cannot find module', '7006': 'Parameter implicitly has an any type'}
+    for match in re.finditer(r'(?<![A-Za-z0-9_./-])(' + path + r'\.(?:tsx?|jsx?))\(([0-9]{1,6}),([0-9]{1,6})\): error TS([0-9]{4,5})\b', text):
+        location, line, column, code = match.groups()
+        detail = f'{location}({line},{column}): error TS{code}'
+        if code in ts_descriptions:
+            detail += ': ' + ts_descriptions[code]
+        details.append(detail)
+    for match in re.finditer(r'(?<![A-Za-z0-9_./-])(/?' + path + r'\.java):\[([0-9]{1,6}),([0-9]{1,6})\]\s+(cannot find symbol|package [A-Za-z0-9_.]{1,150} does not exist|incompatible types|illegal start of expression|reached end of file while parsing)\b', text):
+        details.append(f'{match[1]}:[{match[2]},{match[3]}] {match[4]}')
+    for match in re.finditer(r'\bnpm (?:ERR!|error) code (ERESOLVE|EUSAGE|ENOENT|EACCES|EPERM|ENOSPC|ENOMEM|EINTEGRITY|ETIMEDOUT|ECONNRESET|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|E401|E403|E404|ELIFECYCLE)\b', text):
+        details.append('npm error code ' + match[1])
+    for pattern in (r'\bCOMPILATION (?:ERROR|FAILURE)\b', r'\bno space left on device\b',
+                    r'\bCannot connect to the Docker daemon\b', r'\bfailed to solve\b',
+                    r'\bServer command timed out; inspect status\b'):
+        details.extend(match.group(0) for match in re.finditer(pattern, text))
+    return list(dict.fromkeys(details))[:4]
 
 
 def require(ok, message):
@@ -415,27 +435,35 @@ class Release:
         env = dict(self.env)
         env.update(extra or {})
         # No shell, caller environment, credential forwarding, or source scripts on host.
+        # Successful inspection/cleanup must not erase the primary build error.
+        # Each worker resets its diagnostics when claiming a new job.
         with __import__('tempfile').TemporaryFile() as output:
+            timed_out = False
             try:
                 result = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=timeout, check=False)
             except subprocess.TimeoutExpired:
-                raise Refused('Server command timed out; inspect status')
-            if result.returncode != 0:
-                # Root-only bounded diagnostics, never returned through the member protocol.
+                timed_out = True
+            size = output.seek(0, os.SEEK_END)
+            if timed_out or result.returncode != 0:
+                # Root-only bounded diagnostics. Retain the tail as compiler errors
+                # commonly follow more than 1 MiB of dependency/build progress.
                 output.seek(0)
+                diagnostic_bytes = output.read(512 * 1024)
+                if size > len(diagnostic_bytes):
+                    output.seek(max(len(diagnostic_bytes), size - 512 * 1024))
+                    diagnostic_bytes += output.read(512 * 1024)
                 diagnostic = self.state / 'last-command-failure.log'
                 fd = os.open(diagnostic, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
                 try:
                     os.fchmod(fd, 0o600)
                     with os.fdopen(fd, 'wb', closefd=False) as log:
-                        log.write(output.read(1024 * 1024))
+                        log.write(diagnostic_bytes)
                 finally:
                     os.close(fd)
-            if result.returncode != 0:
-                output.seek(0)
-                self.last_failure_details = failure_details(output.read(1024 * 1024).decode('utf-8', errors='replace'))
-            require(result.returncode == 0, 'Server command failed (output withheld; no business secrets exposed)')
-            size = output.tell()
+                self.last_failure_details = failure_details(diagnostic_bytes.decode('utf-8', errors='replace'))
+                if timed_out:
+                    raise Refused('Server command timed out; inspect status')
+                raise Refused('Server command failed (output withheld; no business secrets exposed)')
             require(size <= 8 * 1024 * 1024, 'Server command output too large')
             output.seek(0)
             return output.read().decode('utf-8')
@@ -821,7 +849,7 @@ class Release:
                 migrating = False  # Keep rollback armed through candidate image health.
                 job.update(status='ready', stage='awaiting-acceptance', observed=observed)
                 self.put('job', key, job)
-            except Exception:
+            except Exception as error:
                 if migrating and database is not None and backup is not None:
                     # DDL can partially commit. Restore the exact current backup,
                     # while writers stay stopped, before returning any result.
@@ -844,6 +872,7 @@ class Release:
                     job['maintenance'] = True
                 # Persist only allowlisted structural diagnostics, not raw output.
                 details = self.deployment_failure_details(job) if job.get('stage') in ('applying', 'health') else list(getattr(self, 'last_failure_details', []))
+                details = failure_details('\n'.join([*details, str(error)]))
                 job.update(status='uncertain' if job.get('stage') in ('applying', 'health') else 'failed', errorDetails=details, error='Server operation failed; inspect read-only reconcile and server diagnostics', finishedAt=int(time.time()))
                 self.put('job', key, job)
 

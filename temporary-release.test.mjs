@@ -85,6 +85,60 @@ class Tests(unittest.TestCase):
    m.Release.run(self.r,[sys.executable,'-c','print("diagnostic-only"); raise SystemExit(1)'])
   log=self.r.state/'last-command-failure.log'
   self.assertEqual(log.read_text(),'diagnostic-only\n');self.assertEqual(log.stat().st_mode & 0o777,0o600)
+ def test_build_diagnostics_strip_source_secrets_and_survive_public_filter(self):
+   raw='''password=secret Authorization: Bearer hidden
+#12 14.1 src/oa/region.ts(1,21): error TS2307: Cannot find module '../../backend/src/main/resources/oa-regions.json' or its corresponding type declarations.
+#12 14.2 src/oa/region.ts(8,10): error TS7006: Parameter 'private-source' implicitly has an 'any' type.
+[ERROR] /workspace/backend/src/main/java/example/App.java:[12,3] cannot find symbol token=hidden
+npm ERR! code ERESOLVE
+The command '/bin/sh -c echo secret' returned a non-zero code: 1
+'''
+   details=m.failure_details(raw)
+   self.assertEqual(details,['src/oa/region.ts(1,21): error TS2307: Cannot find module','src/oa/region.ts(8,10): error TS7006: Parameter implicitly has an any type','/workspace/backend/src/main/java/example/App.java:[12,3] cannot find symbol','npm error code ERESOLVE'])
+   public=m.Release.public_job({'status':'failed','stage':'building','createdAt':1,'errorDetails':[raw]})
+   self.assertEqual(public['errorCode'],'BUILD_FAILED');self.assertEqual(public['errorDetails'],details)
+   for secret in ('secret','hidden','private-source','oa-regions.json','echo'):
+    self.assertNotIn(secret,json.dumps(public))
+   self.assertEqual(m.failure_details('\n'.join(details)),details)
+ def test_fixed_build_failure_categories_and_no_raw_echo(self):
+   raw='''[ERROR] COMPILATION ERROR :
+npm error code EUSAGE token=secret
+failed to solve: process /bin/sh -c echo secret
+no space left on device
+Cannot connect to the Docker daemon at unix:///secret
+'''
+   details=m.failure_details(raw)
+   self.assertEqual(details,['npm error code EUSAGE','COMPILATION ERROR','no space left on device','Cannot connect to the Docker daemon'])
+   self.assertNotIn('secret',json.dumps(details));self.assertEqual(m.failure_details('unrecognized password=secret'),[])
+ def test_command_failure_retains_tail_through_successful_cleanup(self):
+   def fail(argv,**kw):
+    kw['stdout'].write(b'x'*(2*1024*1024)+b'\nsrc/oa/region.ts(1,21): error TS2307: secret\n')
+    return type('R',(),{'returncode':1})()
+   with patch.object(m.subprocess,'run',side_effect=fail):
+    with self.assertRaises(m.Refused):m.Release.run(self.r,['mock'])
+   self.assertEqual(self.r.last_failure_details,['src/oa/region.ts(1,21): error TS2307: Cannot find module'])
+   self.assertLessEqual((self.r.state/'last-command-failure.log').stat().st_size,1024*1024)
+   with patch.object(m.subprocess,'run',return_value=type('R',(),{'returncode':0})()):m.Release.run(self.r,['mock'])
+   self.assertEqual(self.r.last_failure_details,['src/oa/region.ts(1,21): error TS2307: Cannot find module'])
+ def test_worker_keeps_only_safe_exception_diagnostics(self):
+   message='src/oa/region.ts(1,21): error TS2307: password=secret'
+   with patch.object(self.r,'build',side_effect=RuntimeError(message)):
+    job=self.work(self.start(self.plan()))
+   self.assertEqual(job['status'],'failed');self.assertEqual(job['errorDetails'],['src/oa/region.ts(1,21): error TS2307: Cannot find module'])
+   self.assertNotIn('secret',json.dumps(job));self.assertFalse(any(c[0]=='compose' for c in self.r.calls))
+ def test_timeout_retains_private_output_and_safe_summary(self):
+   def timeout(argv,**kw):
+    kw['stdout'].write(b'private-secret\nnpm error code ETIMEDOUT\n')
+    raise m.subprocess.TimeoutExpired(argv,1)
+   with patch.object(m.subprocess,'run',side_effect=timeout):
+    with self.assertRaisesRegex(m.Refused,'timed out'):m.Release.run(self.r,['mock'])
+   self.assertEqual(self.r.last_failure_details,['npm error code ETIMEDOUT'])
+   self.assertIn('private-secret',(self.r.state/'last-command-failure.log').read_text())
+ def test_successful_command_output_limit(self):
+   def run(argv,**kw):
+    kw['stdout'].write(b'x'*(8*1024*1024+1));return type('R',(),{'returncode':0})()
+   with patch.object(m.subprocess,'run',side_effect=run):
+    with self.assertRaisesRegex(m.Refused,'output too large'):m.Release.run(self.r,['mock'])
  def test_preflight_returns_root_cause_without_creating_job(self):
   message="Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible."
   def run(argv,**kwargs):
@@ -337,5 +391,5 @@ test('temporary release isolated Python state machine, archive and lifecycle fix
   const result = spawnSync('python3', ['-I', '-B', '-c', fixture, source], { encoding: 'utf8', timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined);
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.match(result.stderr, /Ran 43 tests/);
+  assert.match(result.stderr, /Ran 49 tests/);
 });

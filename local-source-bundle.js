@@ -4,6 +4,7 @@ import { lstat, mkdtemp, open, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { repositorySlug, runCommand } from './core.js';
+import { reportReleaseProgress } from './release-progress.js';
 
 const MAX_BYTES = 256 * 1024 * 1024;
 const SHA = /^[a-f0-9]{40}$(?![\s\S])/i;
@@ -39,7 +40,7 @@ function ghEnvironment() {
 }
 
 /** Trusted implementation seam: writes raw bytes to an already exclusively opened file. */
-async function downloadTarball({ args, env, handle, maxBytes }) {
+async function downloadTarball({ args, env, handle, maxBytes, onProgress }) {
   const child = spawn('gh', args, { env, shell: false, stdio: ['ignore', 'pipe', 'pipe'] });
   let size = 0, failure;
   const stop = error => { failure ||= error; child.kill('SIGKILL'); };
@@ -63,6 +64,7 @@ async function downloadTarball({ args, env, handle, maxBytes }) {
         if (!written.bytesWritten) throw new Error('Unable to write source archive.');
         offset += written.bytesWritten;
       }
+      reportReleaseProgress(onProgress, 'source-downloading', { bytes: size });
     }
     await completion;
   } catch (error) {
@@ -77,8 +79,9 @@ async function downloadTarball({ args, env, handle, maxBytes }) {
  */
 export function createLocalSourceBundle({ command = runCommand, baseDirectory = tmpdir(), download = downloadTarball } = {}) {
   if (typeof command !== 'function' || typeof download !== 'function') throw new TypeError('Invalid trusted source dependency.');
-  async function resolveHead(input) {
+  async function resolveHead(input, { onProgress } = {}) {
     const { repository, branch } = metadata(input);
+    reportReleaseProgress(onProgress, 'source-resolving');
     const endpoint = `repos/${repository}/git/ref/heads/${branch.split('/').map(encodeURIComponent).join('/')}`;
     let response;
     try {
@@ -92,9 +95,10 @@ export function createLocalSourceBundle({ command = runCommand, baseDirectory = 
         typeof value?.object?.sha !== 'string' || !SHA.test(value.object.sha)) throw new Error('GitHub remote branch binding is invalid.');
     return { repository, branch, head: value.object.sha.toLowerCase() };
   }
-  async function prepare(input) {
+  async function prepare(input, { onProgress } = {}) {
     const snapshot = metadata(input, true);
-    const current = await resolveHead({ repository: snapshot.repository, branch: snapshot.branch });
+    reportReleaseProgress(onProgress, 'source-preparing');
+    const current = await resolveHead({ repository: snapshot.repository, branch: snapshot.branch }, { onProgress });
     if (current.head !== snapshot.head) throw new Error('Remote branch changed from the locked head; refresh the snapshot.');
     const base = await realpath(resolve(baseDirectory));
     if (!(await lstat(base)).isDirectory()) throw new Error('Source bundle base must be a directory.');
@@ -127,14 +131,16 @@ export function createLocalSourceBundle({ command = runCommand, baseDirectory = 
       const path = join(root, 'source.tar.gz');
       handle = await open(path, 'wx+', 0o600);
       const fileIdentity = await handle.stat();
+      reportReleaseProgress(onProgress, 'source-downloading', { bytes: 0 });
       try {
         await download({ args: ['api', `repos/${snapshot.repository}/tarball/${snapshot.head}`, '--hostname', 'github.com'],
-          env: ghEnvironment(), handle, maxBytes: MAX_BYTES });
+          env: ghEnvironment(), handle, maxBytes: MAX_BYTES, onProgress });
       } catch { throw new Error('GitHub source archive download failed (maximum 256 MiB).'); }
       await guard();
       const file = await lstat(path), stat = await handle.stat();
       if (!file.isFile() || file.isSymbolicLink() || file.dev !== fileIdentity.dev || file.ino !== fileIdentity.ino ||
           stat.size !== file.size || stat.size < 18 || stat.size > MAX_BYTES) throw new Error('Invalid or oversized GitHub source archive.');
+      reportReleaseProgress(onProgress, 'source-hashing', { bytes: 0, totalBytes: stat.size });
       const hash = createHash('sha256'), buffer = Buffer.alloc(65536);
       let position = 0;
       while (position < stat.size) {
@@ -142,6 +148,7 @@ export function createLocalSourceBundle({ command = runCommand, baseDirectory = 
         if (!bytesRead) throw new Error('Source archive changed during hashing.');
         if (position === 0 && (buffer[0] !== 0x1f || buffer[1] !== 0x8b || buffer[2] !== 8)) throw new Error('GitHub source archive must be gzip.');
         hash.update(buffer.subarray(0, bytesRead)); position += bytesRead;
+        reportReleaseProgress(onProgress, 'source-hashing', { bytes: position, totalBytes: stat.size });
       }
       await handle.close(); handle = undefined;
       return { path, sha256: hash.digest('hex'), size: stat.size, cleanup };

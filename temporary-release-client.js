@@ -5,7 +5,7 @@ import { readFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { isAbsolute } from 'node:path';
 import { validateReleaseProfile } from './release-profile.js';
-import { NATIVE_SSH_MESSAGES } from './native-ssh.js';
+import { reportReleaseProgress } from './release-progress.js';
 
 const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/;
 const SHA = /^[a-f0-9]{40}$(?![\s\S])/;
@@ -141,7 +141,7 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
     if (!result || result.exitCode !== 0 || result.timedOut || result.truncated || typeof result.stdout !== 'string') throw fail('远程操作未明确响应；请查询状态，不要重复提交发布', 503);
     return result.stdout;
   }
-  async function request({ profile: inputProfile, action, body, bundle }) {
+  async function request({ profile: inputProfile, action, body, bundle, onProgress }) {
     ensure();
     const profile = validateReleaseProfile(inputProfile);
     if (!['check', 'promote', 'start', 'status', 'overview', 'restore', 'accept', 'reconcile'].includes(action)) throw fail('无效发布操作');
@@ -156,12 +156,15 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
       }
       let remoteBundle;
       if (bundle) {
+        reportReleaseProgress(onProgress, 'upload-preparing');
         const upload = '/tmp/dsh-upload-' + randomUUID();
         // Ordinary SSH identity creates its own private data directory; no sudo.
         const code = `import os\nos.umask(0o077)\nos.mkdir('${upload}',0o700)`;
         await exec(profile, `/usr/bin/python3 -I - <<'DSH_TEAM_UPLOAD'\n${code}\nDSH_TEAM_UPLOAD`);
         if (await host(profile) !== identity) throw fail('SSH 配置已变化', 503);
+        reportReleaseProgress(onProgress, 'uploading', { bytes: 0, totalBytes: bundle.size });
         await bridge('/api/dsh-ssh/upload?' + new URLSearchParams({ alias: profile.target.alias, remotePath: upload + '/source.tar' }), { file: bundle.path });
+        reportReleaseProgress(onProgress, 'upload-sealing', { bytes: bundle.size, totalBytes: bundle.size });
         remoteBundle = { path: upload + '/source.tar', sha256: bundle.sha256, size: bundle.size };
         if (await host(profile) !== identity) throw fail('SSH 配置已变化', 503);
         // SFTP may create 0644 independently of the earlier SSH process umask.
@@ -171,6 +174,7 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
       if (await host(profile) !== identity) throw fail('SSH 配置已变化', 503);
       // Only action/body cross the privilege boundary. Server owns profile and ACL.
       const payload = { action, body: { ...body, ...(remoteBundle ? { bundle: remoteBundle } : {}) } };
+      reportReleaseProgress(onProgress, 'submitting');
       const output = await exec(profile, `/usr/bin/python3 -I ${entryPath} '${encode(payload)}'`);
       if (Buffer.byteLength(output) > 65536) throw fail('发布响应超过限制', 503);
       try { return JSON.parse(output); } catch { throw fail('发布响应格式无效', 503); }
@@ -181,15 +185,18 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
     const stage = '/var/tmp/dsh-release-' + uuid, upload = '/tmp/dsh-upload-' + uuid;
     let remoteBundle;
     if (bundle) {
+      reportReleaseProgress(onProgress, 'upload-preparing');
       // User-writable upload is data only. Root never executes a script from here.
       await exec(profile, python(`import os,pwd\nu=pwd.getpwnam('${profile.target.user}')\nos.mkdir('${upload}',0o700)\nos.chown('${upload}',u.pw_uid,u.pw_gid)\nprint('UPLOAD_STAGE_OK')`));
       if (await host(profile) !== identity) throw fail('SSH 配置已变化', 503);
+      reportReleaseProgress(onProgress, 'uploading', { bytes: 0, totalBytes: bundle.size });
       await bridge('/api/dsh-ssh/upload?' + new URLSearchParams({ alias: profile.target.alias, remotePath: upload + '/source.tar' }), { file: bundle.path });
       remoteBundle = { path: stage + '/archive.tar.gz', sha256: bundle.sha256, size: bundle.size };
     }
     if (await host(profile) !== identity) throw fail('SSH 配置已变化', 503);
     const payload = { profile, action, body: { ...body, ...(remoteBundle ? { bundle: remoteBundle } : {}) } };
     const code = `import os,sys,stat,base64,json,hashlib,subprocess,shutil,pwd\nassert os.geteuid()==0 and os.environ.get('SUDO_USER')=='${profile.target.user}', 'sudo identity mismatch'\nstage='${stage}'\nos.umask(0o077)\nos.mkdir(stage,0o700)\nowned=os.lstat(stage)\ndef cleanup_stage():\n try: current=os.lstat(stage)\n except FileNotFoundError: return\n assert stat.S_ISDIR(current.st_mode) and current.st_uid==0 and (current.st_dev,current.st_ino)==(owned.st_dev,owned.st_ino), 'stage identity changed'\n shutil.rmtree(stage)\nresult=None\ntry:\n script=base64.b64decode('${bytes.toString('base64')}')\n assert len(script)<=65536\n fd=os.open(stage+'/script.py',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)\n with os.fdopen(fd,'wb') as f: f.write(script)\n${remoteBundle ? ` upload='${upload}'\n u=pwd.getpwnam('${profile.target.user}')\n s=os.lstat(upload)\n assert stat.S_ISDIR(s.st_mode) and s.st_uid==u.pw_uid\n dfd=os.open(upload,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)\n try:\n  src=os.open('source.tar',os.O_RDONLY|os.O_NOFOLLOW,dir_fd=dfd)\n  with os.fdopen(src,'rb') as f:\n   s=os.fstat(f.fileno())\n   assert stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==u.pw_uid and s.st_size==${bundle.size}\n   dst=os.open(stage+'/archive.tar.gz',os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)\n   h=hashlib.sha256(); n=0\n   with os.fdopen(dst,'wb') as out:\n    while True:\n     chunk=f.read(1048576)\n     if not chunk: break\n     n+=len(chunk); assert n<=${bundle.size}; h.update(chunk); out.write(chunk)\n   assert n==${bundle.size} and h.hexdigest()=='${bundle.sha256}', 'source checksum mismatch'\n  os.unlink('source.tar',dir_fd=dfd)\n finally: os.close(dfd)\n os.rmdir(upload)\n` : ''} result=subprocess.run(['/usr/bin/python3','-I',stage+'/script.py','${encode(payload)}'])\n sys.exit(result.returncode)\nfinally:\n${action === 'start' ? " # Successful start hands this private stage to the worker.\n if result is None or result.returncode!=0: cleanup_stage()" : ' cleanup_stage()'}\n`;
+    reportReleaseProgress(onProgress, 'submitting');
     const output = await exec(profile, python(code));
     if (Buffer.byteLength(output) > 65536) throw fail('发布响应超过限制', 503);
     try { return JSON.parse(output); } catch { throw fail('发布响应格式无效', 503); }
@@ -218,14 +225,13 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
     if (typeof user?.name !== 'string' || !user.name.trim() || (!team && environments.some(environment => !profile.allowedNames[environment].includes(user.name)))) throw fail('插件当前登录姓名不在发布授权名单', 403);
     ensure();
   }
-  async function call(action, body, bundle) {
+  async function call(action, body, bundle, onProgress) {
     ensure();
     let response;
-    try { response = await run({ profile, action, body: structuredClone(body), ...(bundle ? { bundle } : {}) }); }
+    try { response = await run({ profile, action, body: structuredClone(body), ...(bundle ? { bundle } : {}), ...(onProgress ? { onProgress } : {}) }); }
     catch (error) {
       const reason = knownReleaseRefusal(error?.message);
-      const connectionReason = NATIVE_SSH_MESSAGES.includes(error?.message) ? error.message : undefined;
-      throw fail(reason || connectionReason || '临时发布入口未明确响应；请查询状态，不要重复提交发布', reason ? refusalStatus(reason) : connectionReason && [400,409,503].includes(error.status) ? error.status : 503);
+      throw fail(reason || '临时发布入口未明确响应；请查询状态，不要重复提交发布', reason ? refusalStatus(reason) : 503);
     }
     ensure();
     if (!response || ![Object.prototype, null].includes(Object.getPrototypeOf(response))) throw fail('临时发布入口拒绝或未明确响应；请查询状态', 503);
@@ -285,7 +291,8 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
       if (response.operation !== 'restore') throw fail('服务器不支持历史恢复，请升级发布入口', 503);
       return remember(response, body.environment);
     },
-    async start(input = {}) {
+    async start(input = {}, { onProgress } = {}) {
+      reportReleaseProgress(onProgress, 'authorizing');
       const body = object(input, ['planId', 'confirmation', 'databaseRiskAccepted']); id(body.planId); ensure();
       if (body.confirmation !== true || body.databaseRiskAccepted !== true) throw fail('必须明确确认发布及数据库风险');
       // The remembered server plan determines authorization; browser cannot select it.
@@ -296,17 +303,21 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
       await owner([plan.environment]);
       if (plan.expiresAt <= Date.now() / 1000) throw fail('计划已过期，请重新检查');
       plans.delete(body.planId); // One use before source preparation/upload; never replay writes.
+      reportReleaseProgress(onProgress, 'preflight');
       await preflight(plan.environment);
       let bundle;
       try {
         if (plan.environment === 'dev' && !plan.restore) {
           if (!source) throw fail('未配置本地安全源码打包器', 503);
-          bundle = await source.prepare({ repository: profile.repository, branch: profile.branch, head: plan.head });
+          reportReleaseProgress(onProgress, 'source-preparing');
+          bundle = await source.prepare({ repository: profile.repository, branch: profile.branch, head: plan.head }, { onProgress });
           const metadata = bundleInfo(bundle); ensure(); await owner([plan.environment]);
-          return await call('start', body, metadata);
+          reportReleaseProgress(onProgress, 'upload-preparing');
+          return await call('start', body, metadata, onProgress);
         }
-        return await call('start', body);
-      } finally { if (typeof bundle?.cleanup === 'function') await bundle.cleanup(); }
+        reportReleaseProgress(onProgress, 'submitting');
+        return await call('start', body, undefined, onProgress);
+      } finally { if (typeof bundle?.cleanup === 'function') { reportReleaseProgress(onProgress, 'cleanup'); await bundle.cleanup(); } }
     },
     async overview() { return call('overview', {}); },
     async status(jobId) { if (jobId !== undefined) id(jobId); return call('status', jobId === undefined ? {} : { jobId }); },

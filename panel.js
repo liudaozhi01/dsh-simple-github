@@ -32,11 +32,11 @@ export function mount(root,options={}){
   function message(text,bad=false){errors.replaceChildren();if(bad)showError(errors,displayText(text));else errors.textContent=displayText(text);errors.className='sg-notice '+(bad?'sg-error':'sg-success');}
  let requestProgress=null;
  const progressLabels={'/source-history':'读取源码历史','/source-restore-preview':'核对源码恢复范围','/source-restore':'恢复远程及本地源码','/push':'提交与推送','/sync-dev':'拉取与隔离合并','/clone':'提交克隆任务','/update-install':'下载校验更新包','/update-check':'检查更新','/environment-inspect':'检测环境','/environment-notify':'发送配置请求','/inspect':'读取项目','/diff':'读取差异','/switch-dev':'切换协作分支','/docker-plan':'核对发布计划','/docker-promote':'核对晋级计划','/docker-restore':'核对恢复计划','/docker-start':'提交发布任务'};
- function progressNode(label,percent,note){const box=el('div',undefined,'sg-operation-progress');box.setAttribute('role','status');box.setAttribute('aria-live','polite');box.append(el('p',label+' · '+percent+'%'),el('small',note,'sg-muted'));const bar=el('progress');bar.max=100;bar.value=percent;bar.style.width='100%';bar.setAttribute('aria-label',label+'阶段进度');box.append(bar);return box;}
+ function progressNode(label,percent,note){const box=el('div',undefined,'sg-operation-progress');box.setAttribute('role','status');box.setAttribute('aria-live','polite');box.append(el('p',label+(percent==null?' · 进行中':' · '+percent+'%')),el('small',note,'sg-muted'));const bar=el('progress');bar.max=100;if(percent!=null)bar.value=percent;bar.style.width='100%';bar.setAttribute('aria-label',label+'阶段进度');box.append(bar);return box;}
  async function api(path,body){
   const tracked=state.busy&&progressLabels[path];const record=tracked?{label:progressLabels[path],percent:10,note:'阶段进度：请求已发出，等待服务端执行；不是传输字节百分比。'}:null;
   if(record){requestProgress=record;render();}
-  try{const r=await fetch(BASE+path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-Simple-Git-Token':state.csrfToken||''},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(path==='/sync-dev'?600000:180000)});
+  try{const r=await fetch(BASE+path,{method:body===undefined?'GET':'POST',headers:body===undefined?{}:{'Content-Type':'application/json','X-Simple-Git-Token':state.csrfToken||''},...(body===undefined?{}:{body:JSON.stringify(body)}),signal:AbortSignal.timeout(path==='/docker-progress'?3000:path==='/sync-dev'?600000:180000)});
    const data=await r.json();if(!r.ok||(data.ok===false&&!(path==='/source-restore'&&data.needsAction)))throw new Error(data.error||'请求失败 HTTP '+r.status);
    if(record&&requestProgress===record){record.percent=100;record.note='请求已返回；是否推送、部署或安装成功以具体结果为准。';}
    return data;
@@ -70,32 +70,6 @@ export function mount(root,options={}){
  function external(label,url){const n=el('a',label);try{const u=new URL(url);if(u.protocol==='https:'&&u.hostname==='github.com'){n.href=u.href;n.target='_blank';n.rel='noopener noreferrer';}}catch{}return n;}
  async function run(action){if(state.busy||state.clone?.state==='running'||disposed)return;state.busy=true;requestProgress=null;message('');render();try{await action();}catch(e){message(e.message,true);}finally{state.busy=false;if(!disposed){render();if(focusSourcePreview){focusSourcePreview=false;sourcePreviewAnchor?.scrollIntoView?.({block:'start'});sourcePreviewAnchor?.focus?.({preventScroll:true});}}}}
  let configuration=null;
- let sshConfiguration=null,sshCandidate='',sshKeyCandidates=[];
- const sshFingerprint=value=>typeof value==='string'&&/^SHA256:[A-Za-z0-9+/]{43}=?$/.test(value);
- function renderSshConfiguration(){
-  if(!oaAvailable()||activeView!=='settings')return;
-  const box=section('发布服务器连接');
-  box.append(el('p','使用 DSH 宿主系统 SSH，无需单独安装 SSH 插件。仅保存 SSH 用户名和本机私钥绝对路径；不上传私钥、不保存口令，公钥应交给管理员配置。加密私钥请先通过系统 ssh-agent 解锁。','sg-muted'));
-  box.append(button('读取连接配置',async()=>{const config=await api('/ssh-config-read',{});if(disposed)return;sshConfiguration=config;sshCandidate='';for(const key of ['user','privateKeyPath'])if(!drafts.has('ssh-'+key))drafts.set('ssh-'+key,config[key]||'');}));
-  if(!sshConfiguration)return;
-  for(const [key,label] of [['host','服务器地址（只读）'],['port','SSH 端口（只读）']]){const field=el('input');field.value=String(sshConfiguration[key]??'');field.readOnly=true;field.setAttribute('aria-label',label);box.append(el('p',label),field);}
-  const user=input('SSH 用户名',undefined,'ssh-user');user.setAttribute('aria-label','SSH 用户名');
-  const keyPath=input('本机私钥绝对路径',undefined,'ssh-privateKeyPath');keyPath.setAttribute('aria-label','本机私钥绝对路径');keyPath.autocomplete='off';keyPath.spellcheck=false;
-  // Reject pasted key material before retaining it in the in-memory form drafts.
-  keyPath.oninput=()=>{if(/[\r\n\0]|-----BEGIN|^(?:ssh-|ecdsa-|sk-)/i.test(keyPath.value)){keyPath.value=drafts.get('ssh-privateKeyPath')||'';message('这里只接受私钥文件的绝对路径，不接受公钥或私钥正文。',true);return;}drafts.set('ssh-privateKeyPath',keyPath.value);};
-  box.append(el('p','SSH 用户名'),user,el('p','本机私钥绝对路径（不是私钥正文）'),keyPath);
-   box.append(button('自动查找私钥路径',async()=>{sshKeyCandidates=[];const result=await api('/ssh-key-discover',{});if(disposed)return;if(!Array.isArray(result.candidates)||result.candidates.length>64||!result.candidates.every(c=>c&&typeof c.privateKeyPath==='string'&&/^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(c.privateKeyPath)&&!/[\r\n\0]|-----BEGIN/.test(c.privateKeyPath)))throw new Error('私钥候选路径响应无效。');sshKeyCandidates=result.candidates;const current=drafts.get('ssh-privateKeyPath')||'';if(sshKeyCandidates.length===1&&!current){drafts.set('ssh-privateKeyPath',sshKeyCandidates[0].privateKeyPath);message('已填入唯一候选路径；尚未保存，请确认该密钥用于发布服务器。');}else message(sshKeyCandidates.length?'找到 '+sshKeyCandidates.length+' 个候选路径，请选择用于发布服务器的密钥；不会自动保存或连接。':'未找到通过安全检查的候选私钥；可手动填写绝对路径。');}));
-   for(const candidate of sshKeyCandidates)box.append(button('使用路径：'+candidate.privateKeyPath,async()=>{drafts.set('ssh-privateKeyPath',candidate.privateKeyPath);message('候选路径已填入，尚未保存；请确认后保存连接配置。');}));
-   box.append(el('p','仅查找本机 SSH 配置及常见位置，不读取私钥正文；候选文件不代表已获得服务器授权。','sg-muted'));
-  box.append(el('p',sshConfiguration.configured?'连接配置已保存。':'尚未完成连接配置。','sg-muted'));
-  box.append(el('p',sshConfiguration.trusted?'已信任服务器指纹：'+sshConfiguration.fingerprint:'服务器尚未信任；必须先联系管理员核对 SHA256 指纹。','sg-muted'));
-  if(sshCandidate)box.append(el('p','未信任候选指纹：'+sshCandidate,'sg-warning'));
-  const save=button('保存连接配置',async()=>{const username=user.value.trim(),privateKeyPath=keyPath.value.trim();if(!/^[a-z_][a-z0-9_-]*$/.test(username)||username==='root')throw new Error('请填写有效的非 root SSH 用户名（小写字母、数字、下划线或连字符）。');if(!/^(?:\/|[A-Za-z]:[\\/]|\\\\)/.test(privateKeyPath)||/[\r\n\0]|-----BEGIN/.test(privateKeyPath))throw new Error('请填写本机私钥文件的绝对路径，不接受公钥或私钥正文。');const config=await api('/ssh-config-save',{user:username,privateKeyPath});if(disposed)return;sshConfiguration=config;sshCandidate='';drafts.set('ssh-user',username);drafts.set('ssh-privateKeyPath',privateKeyPath);message('发布服务器连接配置已保存。');},true);
-  const scan=button('获取指纹',async()=>{sshCandidate='';const result=await api('/ssh-host-scan',{});if(disposed)return;if(!sshFingerprint(result.fingerprint))throw new Error('服务器未返回有效的 SHA256 指纹，不能信任。');if(sshConfiguration.trusted&&sshConfiguration.fingerprint!==result.fingerprint)throw new Error('服务器 SSH 指纹已变化，已拒绝信任。请联系管理员核实；不会覆盖原有信任。');sshCandidate=result.fingerprint;message('已获取候选指纹；尚未信任，请向管理员核对 SHA256。');});
-  const trust=button('核对后信任',async()=>{const fingerprint=sshCandidate;if(!sshFingerprint(fingerprint)||sshConfiguration.trusted)return;if(!confirm('首次信任发布服务器 '+sshConfiguration.host+':'+sshConfiguration.port+'？\n请务必通过可信渠道让管理员核对以下 SHA256 指纹，完全一致后才点击确定：\n'+fingerprint+'\n未核对或不一致请取消；指纹变化将拒绝连接。'))return;const config=await api('/ssh-host-trust',{fingerprint});if(disposed)return;sshConfiguration=config;sshCandidate='';message('已保存服务器信任；可测试连接。');});trust.disabled=trust.disabled||!sshCandidate||sshConfiguration.trusted;
-  const test=button('测试连接',async()=>{if(!sshConfiguration.configured||!sshConfiguration.trusted)throw new Error('请先保存连接配置，并向管理员核对后信任服务器指纹。');const result=await api('/ssh-connection-test',{});if(!disposed)message(result.message||'只读连接测试成功；未执行部署。');});test.disabled=test.disabled||!sshConfiguration.configured||!sshConfiguration.trusted;
-  box.append(row(save,scan,trust,test),el('p','测试仅执行只读 overview，不会发布或修改服务器。输入修改后请先保存，再测试已保存配置。','sg-muted'));
- }
  function renderGithubAdministration(){
   if(!state.githubAdministrator){configuration=null;return;}
   const box=section('GitHub 管理后台');
@@ -213,11 +187,22 @@ export function mount(root,options={}){
   renderRemoteDeploy();
   renderUpdate();
   renderGithubAdministration();
-   renderSshConfiguration();
    app.setAttribute('aria-busy',String(state.busy));if(focusKey&&!state.busy){const target=[...(app.querySelectorAll?.('input,textarea')||[])].find(n=>n.sgDraftKey===focusKey);target?.focus();if(selection)target?.setSelectionRange(...selection);}
  }
   let remotePlan=null,dockerPreview=null,dockerJob=null,remoteTimer,remoteLoading=false,remoteLoaded=false,remoteFailures=0,remoteHistory=[],remoteReleaseId=null,remotePhase='',remoteProblem='',remoteSubmissionError='',remoteUncertain=false,remotePriorJob=null,remoteSubmittedAt=0;
-  const remoteActive=job=>['pending','running','building','uploading','deploying','checking'].includes(job?.status);
+  let preparation=null,preparationTimer,preparationEpoch=0,preparationStarted=0,preparationPolling=false,preparationUnavailable=false;
+   const preparationNames={authorizing:'核对发布权限',preflight:'服务器发布前检查','source-preparing':'准备远程源码','source-resolving':'核对远程版本','source-downloading':'从 GitHub 下载源码','source-hashing':'校验源码完整性','upload-preparing':'准备上传连接',uploading:'上传源码到服务器','upload-sealing':'校验上传文件',submitting:'提交服务器任务',cleanup:'清理本地临时源码'};
+   const seconds=ms=>(Math.max(0,Number(ms)||0)/1000).toFixed(1)+' 秒';
+   function beginPreparation(){clearTimeout(preparationTimer);preparation=null;preparationUnavailable=false;preparationPolling=true;preparationStarted=Date.now();const epoch=++preparationEpoch;
+    async function poll(){if(disposed||!preparationPolling||epoch!==preparationEpoch)return;
+     try{const result=await api('/docker-progress');if(disposed||epoch!==preparationEpoch||!preparationPolling)return;const p=result.progress;if(p&&p.startedAt>=preparationStarted-2000&&['running','completed','failed'].includes(p.state)){preparation=p;preparationUnavailable=false;}}
+     catch{if(epoch===preparationEpoch)preparationUnavailable=true;}
+     finally{if(!disposed&&preparationPolling&&epoch===preparationEpoch){render();preparationTimer=setTimeout(()=>void poll(),1000);}}
+    }preparationTimer=setTimeout(()=>void poll(),300);
+   }
+   function endPreparation(){preparationPolling=false;++preparationEpoch;clearTimeout(preparationTimer);if(preparation)preparation={...preparation,elapsedMs:Date.now()-preparationStarted};}
+   async function submitRemoteStart(body){beginPreparation();try{return await api('/docker-start',body);}finally{endPreparation();const epoch=preparationEpoch;void (async()=>{try{const r=await fetch(BASE+'/docker-progress',{signal:AbortSignal.timeout(3000)});if(!r.ok)return;const data=await r.json(),p=data.progress;if(!disposed&&epoch===preparationEpoch&&p?.startedAt>=preparationStarted-2000&&['completed','failed'].includes(p.state)){preparation=p;render();}}catch{/* Read-only timing is optional and never changes the submission result. */}})();}}
+   const remoteActive=job=>['pending','running','building','uploading','deploying','checking'].includes(job?.status);
   const databaseBlocked=job=>job?.stage==='db-restore-failed'||job?.database?.status==='restore-failed';
    const remoteBlocked=(environment='test')=>environment==='test'&&((dockerJob?.environment==='test'&&databaseBlocked(dockerJob))||remoteHistory.some(job=>job.environment==='test'&&databaseBlocked(job)));
    const stageNames={'db-preflight':'数据库发布前检查','db-maintenance':'进入数据库维护','db-backup':'备份 test 数据库','db-backup-verify':'校验数据库备份','db-backup-cleanup':'清理过期数据库备份','db-migrating':'同步数据库结构','db-restoring':'恢复 test 数据库','db-restored':'数据库已恢复（发布失败）','db-restore-failed':'数据库恢复失败（维护中，禁止重试）',preparing:'准备源码',uploading:'上传源码',pending:'等待服务器',building:'服务器编译',applying:'更新服务',deploying:'更新服务',checking:'健康检查',health:'健康检查','awaiting-acceptance':'部署成功',accepted:'业务验收已登记',failed:'部署失败',uncertain:'结果待核对',ready:'部署成功'};
@@ -240,15 +225,15 @@ export function mount(root,options={}){
     if(!oaAvailable())return;
    if(environment==='test'&&!canManageRelease())return;
    if(remotePhase||remoteActive(dockerJob)||remoteHistory.some(remoteActive)||remoteUncertain||remoteBlocked(environment))return;
-   remotePhase='正在获取发布计划';remoteProblem='';render();
+   preparation=null;++preparationEpoch;remotePhase='正在获取发布计划';remoteProblem='';render();
    try{
     if(environment==='test'){await refreshRemote();if(!remoteReleaseId)throw new Error('没有可发布的成功 dev 版本，或当前 SSH 账号无 test 发布权限。dev 启动成功即可，无需登记业务验收。');}
      const plan=await api(environment==='dev'?'/docker-plan':'/docker-promote',environment==='dev'?{}:{releaseId:remoteReleaseId});if(disposed)return;
     if(!plan.planId)throw new Error('服务器没有返回有效发布计划');
      const version=plan.head||plan.remote?.head;
-     if(!confirm('确认发布到 '+environment+' 环境？\n'+(environment==='test'?'使用已成功部署的 dev 程序版本和绑定的数据库结构快照，不复制 dev 业务数据；先备份 test 数据库，再同步结构。':'服务器拉取源码并编译发布。')+'\n版本：'+(version?version.slice(0,12):'成功 dev 同版本')+'\n程序启动时按项目配置执行数据库更新，不会用 dev 数据覆盖 test。\n如需回退程序，数据库变更不会自动撤销。'))return;
+     if(!confirm('确认发布到 '+environment+' 环境？\n'+(environment==='test'?'使用已成功部署的 dev 程序版本和绑定的数据库结构快照，不复制 dev 业务数据；先备份 test 数据库，再同步结构。':'本机获取 GitHub 指定版本源码并上传，服务器编译发布；不在本机编译。')+'\n版本：'+(version?version.slice(0,12):'成功 dev 同版本')+'\n程序启动时按项目配置执行数据库更新，不会用 dev 数据覆盖 test。\n如需回退程序，数据库变更不会自动撤销。'))return;
     remotePriorJob=dockerJob?.jobId||null;remoteSubmittedAt=Math.floor(Date.now()/1000);remotePhase=environment==='dev'?'正在获取并上传源码（不在本机编译）':'正在提交同镜像发布';render();
-    try{const result=await api('/docker-start',{planId:plan.planId,confirmation:true,databaseRiskAccepted:true});if(disposed)return;rememberRemote(result);}
+    try{const result=await submitRemoteStart({planId:plan.planId,confirmation:true,databaseRiskAccepted:true});if(disposed)return;rememberRemote(result);}
     catch(error){remoteUncertain=true;remoteSubmissionError=error.message;remoteProblem='提交响应未确认：'+remoteSubmissionError+'。禁止重复发布，请先核对服务器任务。';}
    }catch(error){if(!disposed)remoteProblem='发布未启动：'+error.message;}finally{remotePhase='';if(!disposed){render();scheduleRemote();}}
   }
@@ -256,13 +241,13 @@ export function mount(root,options={}){
     if(!oaAvailable())return;
    if(!canManageRelease())return;
    if(remotePhase||remoteActive(dockerJob)||remoteHistory.some(remoteActive)||remoteUncertain||remoteBlocked(job.environment))return;
-   const environment=job.environment;remotePhase='正在核对历史版本镜像';remoteProblem='';render();
+   const environment=job.environment;preparation=null;++preparationEpoch;remotePhase='正在核对历史版本镜像';remoteProblem='';render();
    try{
     const plan=await api('/docker-restore',{environment,jobId:job.jobId});if(disposed)return;
     if(!plan.planId)throw new Error('服务器没有返回有效恢复计划');
     if(!confirm('确认将 '+environment+' 恢复到版本 '+(job.head?.slice(0,12)||'—')+'？\n原发布人：'+(job.actor||'服务器记录')+'\n复用该环境历史镜像，不重新编译，不影响另一个环境。\n仅恢复程序，数据库变更不会自动撤销；旧程序可能与现有数据库不兼容。'))return;
     remotePriorJob=dockerJob?.jobId||null;remoteSubmittedAt=Math.floor(Date.now()/1000);remotePhase='正在提交 '+environment+' 版本恢复';render();
-    try{const result=await api('/docker-start',{planId:plan.planId,confirmation:true,databaseRiskAccepted:true});if(disposed)return;rememberRemote(result);}
+    try{const result=await submitRemoteStart({planId:plan.planId,confirmation:true,databaseRiskAccepted:true});if(disposed)return;rememberRemote(result);}
     catch(error){remoteUncertain=true;remoteSubmissionError=error.message;remoteProblem='恢复提交响应未确认：'+remoteSubmissionError+'。禁止重复操作，请先核对服务器任务。';}
    }catch(error){if(!disposed)remoteProblem='恢复未启动：'+error.message;}finally{remotePhase='';if(!disposed){render();scheduleRemote();}}
   }
@@ -278,8 +263,14 @@ export function mount(root,options={}){
     if(oaAvailable()){box.append(row(environmentLink('dev'),environmentLink('test')));help.append(el('p','网站链接访问当前环境，不一定是所选历史版本。','sg-muted'));}
    const status=el('div',undefined,'sg-release-status');status.setAttribute('role','status');status.setAttribute('aria-live','polite');
    status.append(el('h4','部署情况'));
-   if(remotePhase||(!remoteProblem&&!remoteUncertain&&remoteActive(dockerJob)&&dockerJob?.activity?.state==='active')){const percent=remotePhase?10:({'db-preflight':30,'db-maintenance':35,'db-backup':40,'db-backup-verify':50,'db-backup-cleanup':55,'db-migrating':65,'db-restoring':70,preparing:10,uploading:20,pending:25,building:40,applying:75,deploying:75,health:90,checking:90}[dockerJob?.stage]??10);status.append(progressNode('发布阶段',percent,'阶段进度，不代表构建耗时或传输字节比例；健康检查通过后才完成。'));}else if(!remoteProblem&&!remoteUncertain&&dockerJob?.status==='delivered')status.append(progressNode('发布完成',100,'服务器已确认交付成功。'));
-   if(remotePhase)status.append(el('p',remotePhase));
+   if(remotePhase||(!remoteProblem&&!remoteUncertain&&remoteActive(dockerJob)&&dockerJob?.activity?.state==='active')){const percent=remotePhase?null:({'db-preflight':30,'db-maintenance':35,'db-backup':40,'db-backup-verify':50,'db-backup-cleanup':55,'db-migrating':65,'db-restoring':70,preparing:10,uploading:20,pending:25,building:40,applying:75,deploying:75,health:90,checking:90}[dockerJob?.stage]??10);status.append(progressNode('发布阶段',percent,'阶段进度，不代表构建耗时或传输字节比例；健康检查通过后才完成。'));}else if(!remoteProblem&&!remoteUncertain&&dockerJob?.status==='delivered')status.append(progressNode('发布完成',100,'服务器已确认交付成功。'));
+   if(remotePhase)status.append(el('p',preparationPolling?(preparationNames[preparation?.stage]||'正在准备发布（不在本机编译）'):remotePhase));
+    if(preparationPolling){status.append(el('p','提交前准备已用 '+seconds(Date.now()-preparationStarted)+(preparation?' · 当前步骤 '+seconds(preparation.stageElapsedMs):''),'sg-muted'));if(preparationUnavailable)status.append(el('p','暂时无法读取分步进度，发布请求仍在等待；不会自动重新提交。','sg-muted'));}
+    if(preparation){
+     if(!preparationPolling)status.append(el('p','本次提交前准备耗时 '+seconds(preparation.elapsedMs)+'（与下方服务器执行耗时分开统计；非部署成功凭据）','sg-muted'));
+     if(Array.isArray(preparation.completedStages)&&preparation.completedStages.length){const timings=disclosure('preparation-timings');timings.append(el('summary','查看提交前各步骤耗时'));for(const step of preparation.completedStages)if(preparationNames[step.stage])timings.append(el('p',preparationNames[step.stage]+'：'+seconds(step.durationMs),'sg-muted'));status.append(timings);}
+     if(preparationPolling&&preparation.stage==='source-downloading'&&Number.isFinite(preparation.bytes))status.append(el('p','已下载 '+(preparation.bytes/1048576).toFixed(1)+' MiB（总大小由 GitHub 返回，不估算剩余时间）','sg-muted'));
+    }
    if(remoteProblem)status.append(renderSchemaRefusal(displayText(remoteProblem),el,disclosure)||el('p',errorFeedback(displayText(remoteProblem)).detail,'sg-warning'));
    if(remoteBlocked())status.append(el('p','数据库恢复失败，test 仍处于维护中，禁止重试 test 发布或 test 历史恢复；请联系管理员核对并人工恢复。','sg-warning'));
     if(dockerJob){
@@ -358,7 +349,7 @@ function renderCode(repo){
  const branch=collaborationBranch(),afterPush=oaAvailable()?'再发布 dev 在线测试。':'请按项目要求完成验证。';
   const code=section('3 · 共用分支开发 · '+branch),changes=(repo.changes||[]).filter(c=>!unmerged(c)),onDev=repo.branch===branch;
  code.append(el('p',`开工前可选同步 ${branch} 最新代码 → 开发与自测 → 提交并推送`+(oaAvailable()?' → 发布 dev → 在线测试。':'。请按项目要求完成验证。'),'sg-muted'));
-  code.append(el('p',`不必先点同步才能推送：提交并推送会自动获取远程 ${branch} 并检查合并；若整合后代码有变化，会暂停推送，待审查、自测后再次提交推送。`,'sg-muted'));
+  code.append(el('p',`不必先点同步才能推送：提交并推送会自动获取远程 ${branch} 并检查合并；若整合后代码有变化，会提示确认继续推送；可取消，先审查、自测后再推送。`,'sg-muted'));
  if(!onDev){code.append(el('p',`当前不在 ${branch}。请先确认旧分支的工作已保存，再切换。旧分支会保留，但其中独有的代码不会自动带到 ${branch}；有未提交改动时会拦截。`,'sg-warning'),button(`切换到 ${branch}`,async()=>{if(!confirm(`切换到本地 ${branch}（没有则从远程创建）？旧任务分支保留，不自动合并其代码。请先确认没有遗漏旧任务成果。`))return;await api('/switch-dev',{directory:repo.directory,...expected(repo)});state.pushResult=null;state.pullResult=null;await inspect();message(`已切换到 ${branch}，开工前可点击“同步最新代码”。`);},true));}
  const pull=button(state.pulling?'正在同步最新代码…':'同步最新代码',async()=>{
   if(!onDev)throw new Error(`请先切换到 ${branch}。`);
@@ -382,15 +373,24 @@ function renderCode(repo){
  const submit=button(state.pushing?'正在提交…':`提交并推送到 ${branch}`,async()=>{
   if(!onDev)throw new Error(`请先切换到 ${branch}。`);
   if(!msg.value.trim())throw new Error('请填写提交说明。');
-  if(!confirm(`确认已检查本次改动，提交并推送到共用 ${branch}？整合新代码时会暂停，需审查后重新提交。推送不会自动部署；${afterPush}`))return;
+  if(!confirm(`确认已检查本次改动，提交并推送到共用 ${branch}？若整合了新代码，会再次弹窗确认是否继续推送；可取消后先审查、自测。推送不会自动部署；${afterPush}`))return;
   const sid=options.getSessionId?.();noticeStatus='';
    state.pushing=true;state.pushResult=null;render();
-  try{const result=await api('/push',{directory:repo.directory,...expected(repo),message:msg.value.trim(),confirmedSelfTest:true});state.pushResult={text:result.conflict?`本次与最新 ${branch} 的隔离合并发现冲突，开发目录未写入合并结果，未推送：`+result.files.join('、')+'。会话将提出解决方案，等你确认后再修改开发代码、自测重试。':result.needsReview?`已整合同事最新代码，尚未推送。请审查整合后的改动，再提交推送；${afterPush}`:`✓ 已成功推送到共用 ${branch}。`,failed:Boolean(result.conflict)};try{await inspect();if(result.conflict)await notifyConflict(result,sid);}catch(error){state.pushResult={text:state.pushResult.text+' 刷新失败：'+error.message,failed:true};}}
+  try{let result=await api('/push',{directory:repo.directory,...expected(repo),message:msg.value.trim(),confirmedSelfTest:true});
+    if(result.needsReview&&!result.conflict){
+     state.pushResult={text:`已整合同事最新代码，尚未推送。正在刷新合并后的状态…`,failed:false};
+     await inspect();
+     const merged=state.repo;
+     if(!disposed&&merged?.directory===repo.directory&&merged.branch===repo.branch&&merged.repository===repo.repository&&confirm(`最新 ${branch} 代码已合并到本地，尚未推送。\n合并后代码可能发生变化，请确认已审查并完成必要自测。\n点击“确定”：继续提交并推送到 ${branch}。\n点击“取消”：保留本地合并结果，先审查/自测，稍后再推送。\n推送不会自动部署。`)){
+      result=await api('/push',{directory:merged.directory,...expected(merged),message:msg.value.trim(),confirmedSelfTest:true});
+     }
+    }
+    state.pushResult={text:result.conflict?`本次与最新 ${branch} 的隔离合并发现冲突，开发目录未写入合并结果，未推送：`+result.files.join('、')+'。会话将提出解决方案，等你确认后再修改开发代码、自测重试。':result.needsReview?`已整合同事最新代码，尚未推送。请审查整合后的改动，再提交推送；${afterPush}`:`✓ 已成功推送到共用 ${branch}。`,failed:Boolean(result.conflict)};try{await inspect();if(result.conflict)await notifyConflict(result,sid);}catch(error){state.pushResult={text:state.pushResult.text+' 刷新失败：'+error.message,failed:true};}}
   catch(error){state.pushResult={text:'推送未确认完成，本地提交可能已保存：'+error.message,failed:true};try{await inspect();}catch{}}finally{state.pushing=false;}
  },true);submit.disabled=state.busy||!onDev;push.append(submit);
  push.append(el('p',`DSH 修改的文件已在本机，无需额外点击保存。检查改动后提交推送，${afterPush}不强推；冲突请让 DSH 协助处理。${oaAvailable()?'test / 生产发布仍由负责人操作。':''}`,'sg-muted'));
 }
 state.directory=savedProject();
  render();void run(async()=>{await refreshStatus();await reconciliation;if(disposed)return;if(!updateResult)await checkUpdate();if(disposed||!state.directory)return;try{await inspect();if(!disposed)message('已恢复上次选择的项目。');}catch(error){if(!disposed)message('无法恢复上次项目，已保留路径，请检查目录或重新选择：'+error.message,true);}});
- return()=>{disposed=true;++loginGeneration;clearTimeout(timer);clearTimeout(cloneTimer);clearTimeout(remoteTimer);root.replaceChildren();};
+ return()=>{disposed=true;++loginGeneration;clearTimeout(timer);clearTimeout(cloneTimer);clearTimeout(remoteTimer);clearTimeout(preparationTimer);++preparationEpoch;root.replaceChildren();};
 }

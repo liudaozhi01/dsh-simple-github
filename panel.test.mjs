@@ -90,6 +90,28 @@ test('shared dev switch preserves old tasks and push integration requires retest
  assert.ok(!all(root).some(n=>n.tagName==='button'&&n.textContent==='保存本地提交（不推送）'));assert.ok(!calls.some(c=>c.url.endsWith('/commit-local')));
  }finally{dispose?.();Object.assign(globalThis,old);}
 });
+for(const proceed of [true,false])test(`merged push asks confirmation and ${proceed?'continues with refreshed snapshot':'cancels without another push'}`,async()=>{
+ const old={document:globalThis.document,fetch:globalThis.fetch,confirm:globalThis.confirm};let dispose,pushes=0,inspects=0;const prompts=[],requests=[];
+ globalThis.document={createElement:tag=>new Element(tag)};
+ globalThis.confirm=text=>{prompts.push(text);return prompts.length===1||proceed;};
+ globalThis.fetch=async(url,opts={})=>{
+  let data={};
+  if(url.endsWith('/status'))data={user:{login:'alice'},csrfToken:'csrf'};
+  if(url.endsWith('/inspect')){inspects++;data={directory:'/fixture',branch:'dev',baseBranch:'main',repository:'owner/repo',head:inspects===1?'before':'merged',fingerprint:inspects===1?'old':'new',changes:[]};}
+  if(url.endsWith('/push')){requests.push(JSON.parse(opts.body));data=++pushes===1?{needsReview:true}:{ok:true};}
+  return {ok:true,json:async()=>data};
+ };
+ try{
+  const root=new Element('root');dispose=mount(root);await tick();
+  const dir=find(root,n=>n.placeholder?.startsWith('项目文件夹'));dir.value='/fixture';dir.onkeydown({key:'Enter',preventDefault(){}});await tick();
+  const msg=find(root,n=>n.placeholder?.startsWith('提交说明'));msg.value='save';msg.oninput();
+  find(root,n=>n.textContent==='提交并推送到 dev').onclick();await tick();await tick();
+  assert.equal(prompts.length,2);assert.ok(prompts[1].includes('尚未推送'));assert.ok(prompts[1].includes('取消'));
+  assert.equal(pushes,proceed?2:1);
+  if(proceed){assert.equal(requests[1].expectedHead,'merged');assert.equal(requests[1].expectedFingerprint,'new');assert.ok(all(root).some(n=>n.textContent.includes('✓ 已成功推送')));}
+  else assert.ok(all(root).some(n=>n.textContent.includes('尚未推送')));
+ }finally{dispose?.();Object.assign(globalThis,old);}
+});
 test('dev pull shows loading, blocks duplicates and reports success, conflict and failure',async()=>{
  const old={document:globalThis.document,fetch:globalThis.fetch,confirm:globalThis.confirm};let finish,mode='success',count=0,dispose;
  globalThis.document={createElement:tag=>new Element(tag)};globalThis.confirm=()=>true;

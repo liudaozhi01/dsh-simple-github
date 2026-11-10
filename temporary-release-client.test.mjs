@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import http from 'node:http';
+import { fileURLToPath } from 'node:url';
 import { createTemporaryReleaseClient, createTemporaryReleaseTransport } from './temporary-release-client.js';
 import { DEFAULT_RELEASE_PROFILE } from './release-profile.js';
 const HEAD = 'a'.repeat(40);
@@ -97,6 +99,67 @@ test('unknown transport failures remain private and uncertain', async () => {
   const f = fixture('刘道志', { transport: async () => { throw Error('password=secret'); } });
   await assert.rejects(f.client.check(), error => /未明确响应/.test(error.message) && !error.message.includes('secret'));
 });
+async function loopbackBridge(t, respond) {
+  const calls = [];
+  const server = http.createServer(async (req, res) => {
+    let body = ''; for await (const chunk of req) body += chunk;
+    const call = { path: req.url, method: req.method, body, headers: req.headers }; calls.push(call);
+    const response = respond(call, calls);
+    res.writeHead(response.status ?? 200, { 'content-type': 'application/json' });
+    res.end(typeof response.body === 'string' ? response.body : JSON.stringify(response.body));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  return { port: server.address().port, calls };
+}
+
+test('default production team transport uses DSH hosts, exec and NDJSON upload without native SSH', async t => {
+  const p = profile();
+  const bridge = await loopbackBridge(t, call => {
+    if (call.path === '/api/dsh-ssh/hosts') return { body: { hosts: [{ ...p.target, user: 'member', auth: 'key', proxyJump: [], updatedAt: 1 }] } };
+    if (call.path.startsWith('/api/dsh-ssh/upload?')) return { body: '{"type":"progress","bytes":1}\n{"type":"result","ok":true}\n' };
+    assert.equal(call.path, '/api/dsh-ssh/exec');
+    return { body: { result: { exitCode: 0, stdout: '{"ok":true}', timedOut: false, truncated: false } } };
+  });
+  const transport = createTemporaryReleaseTransport({ port: bridge.port, team: true }); t.after(() => transport.close());
+  const body = { planId: 'p', confirmation: true, databaseRiskAccepted: true };
+  assert.deepEqual(await transport.request({ profile: p, action: 'start', body, bundle: { path: fileURLToPath(import.meta.url), size: 123, sha256: 'c'.repeat(64) } }), { ok: true });
+  const hosts = bridge.calls.filter(c => c.path === '/api/dsh-ssh/hosts'); assert.equal(hosts.length, 4); assert.ok(hosts.every(c => c.method === 'GET'));
+  const uploads = bridge.calls.filter(c => c.path.startsWith('/api/dsh-ssh/upload?')); assert.equal(uploads.length, 1);
+  const upload = new URL(uploads[0].path, 'http://localhost'); assert.equal(upload.searchParams.get('alias'), p.target.alias); assert.match(upload.searchParams.get('remotePath'), /^\/tmp\/dsh-upload-[a-f0-9-]+\/source\.tar$/);
+  assert.equal(uploads[0].method, 'POST'); assert.equal(uploads[0].headers['content-type'], 'application/octet-stream'); assert.ok(uploads[0].body.length > 0);
+  const execs = bridge.calls.filter(c => c.path === '/api/dsh-ssh/exec').map(c => JSON.parse(c.body)); assert.equal(execs.length, 3);
+  assert.ok(execs.every(c => c.alias === p.target.alias && c.timeoutMs === 180000));
+  assert.ok(execs.every(c => !/sudo|ssh-keyscan|ssh-keygen|privateKey/.test(c.command)));
+  assert.match(execs[2].command, /^\/usr\/bin\/python3 -I \/usr\/local\/libexec\/xian-oa-team-entry.py /);
+  const encoded = execs[2].command.match(/'([^']+)'$/)[1], payload = JSON.parse(Buffer.from(encoded, 'base64'));
+  assert.deepEqual(Object.keys(payload).sort(), ['action', 'body']); assert.equal(payload.body.bundle.sha256, 'c'.repeat(64)); assert.equal(payload.action, 'start');
+});
+
+test('missing DSH SSH bridge fails once without native or alternate endpoint fallback', async t => {
+  const bridge = await loopbackBridge(t, () => ({ status: 404, body: { error: 'missing' } }));
+  const transport = createTemporaryReleaseTransport({ port: bridge.port, team: true }); t.after(() => transport.close());
+  await assert.rejects(transport.request({ profile: profile(), action: 'status', body: {} }), /SSH 桥接失败 \(404\)/);
+  assert.deepEqual(bridge.calls.map(c => c.path), ['/api/dsh-ssh/hosts']);
+});
+
+test('default DSH bridge refuses changed destination, root account and proxy configuration before exec', async t => {
+  for (const change of [{ host: 'wrong' }, { port: 23 }, { user: 'root' }, { proxyJump: ['jump'] }, { proxyCommand: 'proxy' }]) {
+    const bridge = await loopbackBridge(t, () => ({ body: { hosts: [{ ...profile().target, user: 'member', auth: 'key', proxyJump: [], ...change }] } }));
+    const transport = createTemporaryReleaseTransport({ port: bridge.port, team: true }); t.after(() => transport.close());
+    await assert.rejects(transport.request({ profile: profile(), action: 'status', body: {} }), /身份不匹配/);
+    assert.equal(bridge.calls.length, 1);
+  }
+});
+
+test('default bridge detects saved SSH identity changes before submission without retry', async t => {
+  let reads = 0;
+  const bridge = await loopbackBridge(t, () => ({ body: { hosts: [{ ...profile().target, user: 'member', auth: 'key', proxyJump: [], updatedAt: ++reads }] } }));
+  const transport = createTemporaryReleaseTransport({ port: bridge.port, team: true }); t.after(() => transport.close());
+  await assert.rejects(transport.request({ profile: profile(), action: 'status', body: {} }), /SSH 配置已变化/);
+  assert.deepEqual(bridge.calls.map(c => c.path), ['/api/dsh-ssh/hosts', '/api/dsh-ssh/hosts']);
+});
+
 test('generated bundle bootstrap compiles and verifies bytes before root invocation', async () => {
   const commands = [], p = profile();
   const transport = createTemporaryReleaseTransport({ port: 1, script: 'pass', bridge: async (path, { json, file }) => {
