@@ -1,0 +1,170 @@
+{
+  "format": 1,
+  "name": "xian-oa-github-web",
+  "version": "0.15.29",
+  "notes": "支持远程更新地址配置、更新校验、自动重启及失败恢复。",
+  "files": [
+    {
+      "path": "core.js",
+      "url": "files/core.js",
+      "size": 77249,
+      "sha256": "e2f56dda5f93e136fbb4f6a8cad4501821e1b3226c18409a0951570e6c138c5a"
+    },
+    {
+      "path": "platform.js",
+      "url": "files/platform.js",
+      "size": 6950,
+      "sha256": "77c18e2bf04aec4ae8df5326cd87b526e353bea49c75b37d4c137806c6d99d68"
+    },
+    {
+      "path": "github-config.js",
+      "url": "files/github-config.js",
+      "size": 2444,
+      "sha256": "2caf29936505b37cdc863225dfe453c2304062c44c89e73c2115232d0af75b1f"
+    },
+    {
+      "path": "github-config-store.js",
+      "url": "files/github-config-store.js",
+      "size": 2162,
+      "sha256": "4699051ae02e3b16be30663a08056e96ead2d8b81a0d630bd944b85782e91509"
+    },
+    {
+      "path": "panel.js",
+      "url": "files/panel.js",
+      "size": 82087,
+      "sha256": "f21d85695e9fb72e1dc1553acb5197849d74e928f1bcebe9c4066f56b0dfc1e1"
+    },
+    {
+      "path": "panel.css",
+      "url": "files/panel.css",
+      "size": 5935,
+      "sha256": "b6dd1a9b2122c104563ef7a77f8d72541e6c590f14ec6e7aab39e2165ad4ec57"
+    },
+    {
+      "path": "error-feedback.js",
+      "url": "files/error-feedback.js",
+      "size": 6082,
+      "sha256": "1e900651edda17ba68379af9d42a63a0897f8bc00cd8f7085082fc6b21e7724c"
+    },
+    {
+      "path": "schema-review-message.js",
+      "url": "files/schema-review-message.js",
+      "size": 2924,
+      "sha256": "30a2cb99a361578871568c9ac61f3bdb6c8e0c1c83c5ea422034103c4ba04ae8"
+    },
+    {
+      "path": "native-ssh.js",
+      "url": "files/native-ssh.js",
+      "size": 26747,
+      "sha256": "13c0d717bba30128434b074753a880c9214a09c778f003815fe0613f890c9669"
+    },
+    {
+      "path": "local-source-bundle.js",
+      "url": "files/local-source-bundle.js",
+      "size": 9293,
+      "sha256": "27334f8e4df86ecc9ff15d08c480bd8fa463ab0a6e036424ab05637bf59b7f24"
+    },
+    {
+      "path": "release-profile.js",
+      "url": "files/release-profile.js",
+      "size": 4370,
+      "sha256": "56941f58b16f32a21d76e4824bc290fc8facb7d2d325c5e4bd6e626aa74d88a2"
+    },
+    {
+      "path": "release-progress.js",
+      "url": "files/release-progress.js",
+      "size": 3409,
+      "sha256": "8ed32be9ec800d7b177c23fe426c184dfac02b036c60ccabcc370e6b94c3ecd5"
+    },
+    {
+      "path": "temporary-release-client.js",
+      "url": "files/temporary-release-client.js",
+      "size": 28500,
+      "sha256": "5043c94233805b45dc1c73fc37929d763197844fc376af0af991d9bb424a5cb4"
+    },
+    {
+      "path": "local-deploy.js",
+      "url": "files/local-deploy.js",
+      "size": 153,
+      "sha256": "6abf4ba32098c03ba7b44e59f9430b45c5d76dbaaa076535ee89ba6d7dff09ca"
+    },
+    {
+      "path": "web/server.js",
+      "url": "files/web/server.js",
+      "size": 8077,
+      "sha256": "3d0ac03fe8bfa55f0b0746f2d8a3b79a748ed4e3151ec5885655f20ff089ef58"
+    },
+    {
+      "path": "web/index.html",
+      "url": "files/web/index.html",
+      "size": 479,
+      "sha256": "78d1f2c1a113ab2979a482808f0de1cb77dacf30d1bfea7a36e06f9783b29032"
+    },
+    {
+      "path": "web/start.js",
+      "url": "files/web/start.js",
+      "size": 165,
+      "sha256": "2cfc58d311eec79c014deae259240569814e2267fe1a3e66465dc1336ceddca4"
+    },
+    {
+      "path": "web/release.js",
+      "url": "files/web/release.js",
+      "size": 6192,
+      "sha256": "f13447a9a03ae9453e860d3778d300883a082706643f030c7069aff769a3fa6c"
+    },
+    {
+      "path": "web/release-profile.json",
+      "url": "files/web/release-profile.json",
+      "size": 969,
+      "sha256": "b813f10db9347aac347f1324904d3721ce3bff13d1f35f6d17a25bcb5c0151cc"
+    },
+    {
+      "path": "web/setup-release.js",
+      "url": "files/web/setup-release.js",
+      "size": 836,
+      "sha256": "4af727e518a427e621812600f56e56093ce1bbf5d924850cbb05c41a4d821d9b"
+    },
+    {
+      "path": "web/README.md",
+      "url": "files/web/README.md",
+      "size": 3544,
+      "sha256": "4551d002f736dd59068f739508f8047b7a2ef29bfd9d8b3f46bd98dee86cbe84"
+    },
+    {
+      "path": "web/update.js",
+      "url": "files/web/update.js",
+      "size": 8483,
+      "sha256": "82588ae13283c3f2159ac57c83caecd4c57ec5d2145f63c88de3db84d36dc805"
+    },
+    {
+      "path": "web/launch.js",
+      "url": "files/web/launch.js",
+      "size": 6411,
+      "sha256": "08ba7c80737394e216d7a26f0bc7c3910b9c6d4449fc969ee06aab4e095f5263"
+    },
+    {
+      "path": "README.md",
+      "url": "files/README.md",
+      "size": 3429,
+      "sha256": "51133fe3ad45a39c9b89d4fc90ea39c3f47cacfa1a3b578e6ddd62bf2b0eeff1"
+    },
+    {
+      "path": "package.json",
+      "url": "files/package.json",
+      "size": 172,
+      "sha256": "8f5eb10d114f2938ab0005a60859b79bde3be55798b63799d6baba9e333a2ca8"
+    },
+    {
+      "path": "start.cmd",
+      "url": "files/start.cmd",
+      "size": 49,
+      "sha256": "73a1e4b1fcd912bd50f061a4dd06627e1254681eb971394e6b2237e869a24b59"
+    },
+    {
+      "path": "start.command",
+      "url": "files/start.command",
+      "size": 62,
+      "sha256": "9dc3ea6944fa95334a73bbdeeee8dcefeb1941442cfd82221316df2a678a763c"
+    }
+  ]
+}
