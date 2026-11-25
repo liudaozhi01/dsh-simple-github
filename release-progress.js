@@ -1,4 +1,4 @@
-// Local preparation diagnostics only. Never retain request metadata, paths or errors.
+// Local preparation diagnostics and safe job recovery only. Never retain request metadata, paths or errors.
 const STAGES = new Set(['authorizing', 'preflight', 'source-preparing', 'source-resolving',
   'source-downloading', 'source-hashing', 'upload-preparing', 'uploading',
   'upload-sealing', 'submitting', 'cleanup']);
@@ -33,15 +33,18 @@ export function createReleaseProgress({ now = Date.now } = {}) {
   }
   return Object.freeze({
     begin() {
-      if (record.state === 'running') throw Object.assign(new Error('本机已有发布准备正在进行，请等待并查询进度，不要重复提交'), { status: 409 });
+      if (record.state === 'running') throw Object.assign(new Error('本机已有发布准备正在进行，请等待并查询进度，不要重复提交'), { status: 409, code: 'RELEASE_PREPARATION_RUNNING' });
       const time = now();
       record = { state: 'running', startedAt: time, updatedAt: time, finishedAt: null, stage: 'authorizing', completedStages: [] };
       stageStartedAt = time;
       const current = ++generation;
       return event => { if (current === generation) update(event); };
     },
-    finish(success) {
+    finish(success, result) {
       if (record.state !== 'running') return;
+      // Production release IDs are random 128-bit hex identifiers, not request data.
+      // Retain no raw result (which can include actor, worker tokens or bundle paths).
+      if (success && typeof result?.jobId === 'string' && /^[a-f0-9]{32}$/.test(result.jobId)) record.jobId = result.jobId;
       const time = timestamp();
       record.completedStages.push({ stage: record.stage, durationMs: time - stageStartedAt });
       if (record.completedStages.length > 64) record.completedStages.shift();

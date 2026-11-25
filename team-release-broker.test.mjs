@@ -221,6 +221,35 @@ class BrokerTests(unittest.TestCase):
         for key in ('../evil','a'*31,True,None):
             with self.assertRaises(b.Refused): b.identifier(key)
 
+    def test_schema_state_has_separate_bounded_limit_from_config(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(b, 'private'):
+            root = pathlib.Path(tmp)
+            self.broker.state = root
+            path = root / ('plan-' + 'a'*32 + '.json')
+            value = {'actor':'reviewer', 'environment':'test',
+                     'databaseSchema':{'ddl':'x' * 600000},
+                     'databaseTargetSchema':{'ddl':'y' * 600000}}
+            path.write_text(json.dumps(value))
+            self.assertGreater(path.stat().st_size, b.MAX_CONFIG)
+            self.assertEqual(self.broker.record('plan', 'a'*32), value)
+            self.assertEqual(self.broker.environment({'action':'start','body':{'planId':'a'*32}}, 'reviewer'), 'test')
+            with self.assertRaisesRegex(b.Refused, 'State/config too large'):
+                b.read_json(path)
+            # Exact bound is accepted, excess is rejected before JSON parsing.
+            path.write_bytes(b'{}' + b' ' * (b.MAX_STATE - 2))
+            self.assertEqual(self.broker.record('plan', 'a'*32), {})
+            with path.open('ab') as stream: stream.write(b' ')
+            with self.assertRaisesRegex(b.Refused, 'Release state too large'):
+                self.broker.record('plan', 'a'*32)
+            # Detect growth after fstat as well; never parse truncated content.
+            path.write_bytes(b'{}' + b' ' * (b.MAX_CONFIG - 1))
+            from types import SimpleNamespace
+            with patch.object(b.os, 'fstat', return_value=SimpleNamespace(st_size=2)):
+                with self.assertRaisesRegex(b.Refused, 'State/config too large'):
+                    b.read_json(path)
+            self.assertEqual(b.MAX_REQUEST, 16384)
+            self.assertEqual(b.MAX_RESPONSE, 65536)
+
     def test_config_requires_private_root_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
             config=pathlib.Path(tmp)/'config.json'; config.write_text('{}'); config.chmod(0o644)
@@ -242,5 +271,5 @@ unittest.main(verbosity=2)
 `;
   const result = spawnSync('python3', ['-I', '-c', script], { cwd: root, encoding: 'utf8', timeout: 30000 });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 17 tests/);
+  assert.match(result.stderr, /Ran 18 tests/);
 });

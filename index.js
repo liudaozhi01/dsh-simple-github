@@ -56,7 +56,7 @@ export function apply(ctx, config = {}) {
       if (!url.pathname.startsWith(`${API_BASE}/`)) throw new ApiError('Not found', 404);
       const name = url.pathname.slice(API_BASE.length + 1);
       const get = name === 'status' || name === 'docker-progress' || (name === 'login' && url.searchParams.has('id'));
-      const routes = ['github-config-read','github-config-save','docker-progress','docker-overview','docker-status','docker-accept','docker-reconcile','docker-start','docker-plan','docker-promote','docker-restore','docker-preview','error-notify','remote-dev-check','remote-dev-start','remote-dev-status','remote-deploy-notify','environment-inspect','environment-notify','update-check','update-install','choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','source-history','source-restore-preview','source-restore','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
+      const routes = ['github-config-read','github-config-save','docker-progress','docker-overview','docker-status','docker-accept','docker-reconcile','docker-migration-report','docker-migration-retry','docker-start','docker-plan','docker-promote','docker-restore','docker-preview','error-notify','remote-dev-check','remote-dev-start','remote-dev-status','remote-deploy-notify','environment-inspect','environment-notify','update-check','update-install','choose-directory','status','login','logout','repos','clone','clone-status','inspect','diff','source-history','source-restore-preview','source-restore','switch-dev','sync-dev','commit-local','push','notify-conflict','deploy-status','deploy-start','deploy-stop','deploy-check','deploy-confirm'];
       if (!routes.includes(name)) throw new ApiError('Not found', 404);
       if (req.method !== (get ? 'GET' : 'POST')) throw new ApiError(get ? 'GET required' : 'POST required', 405);
       let body = {};
@@ -65,8 +65,8 @@ export function apply(ctx, config = {}) {
       if (name === 'github-config-read') { reply(200, await configStore.read()); return; }
       if (name === 'github-config-save') { reply(200, await configStore.save(body)); return; }
       if (!oaProject && (name.startsWith('docker-') || name.startsWith('deploy-') || name.startsWith('remote-dev-') || ['remote-deploy-notify','environment-inspect','environment-notify'].includes(name))) throw new ApiError('当前项目未适配 OA 专属部署功能，不能使用原项目部署目标', 409);
-      if (['docker-plan','docker-promote','docker-restore','docker-start','docker-progress','docker-overview','docker-status','docker-accept','docker-reconcile'].includes(name) && !dockerRuntime) throw new ApiError('尚未配置受控项目发布参数 releaseProfile；团队发布需管理员一次性配置受控入口，成员无需 sudo', 409);
-      if (dockerRuntime && ['docker-plan','docker-promote','docker-restore','docker-start','docker-progress','docker-overview','docker-status','docker-accept','docker-reconcile'].includes(name)) {
+      if (['docker-plan','docker-promote','docker-restore','docker-start','docker-progress','docker-overview','docker-status','docker-accept','docker-reconcile','docker-migration-report','docker-migration-retry'].includes(name) && !dockerRuntime) throw new ApiError('尚未配置受控项目发布参数 releaseProfile；团队发布需管理员一次性配置受控入口，成员无需 sudo', 409);
+      if (dockerRuntime && ['docker-plan','docker-promote','docker-restore','docker-start','docker-progress','docker-overview','docker-status','docker-accept','docker-reconcile','docker-migration-report','docker-migration-retry'].includes(name)) {
         if (name === 'docker-progress') {
           if ([...url.searchParams].length) throw new ApiError('发布准备进度不接受参数', 400);
           reply(200, { ok: true, progress: releaseProgress.snapshot() }); return;
@@ -75,7 +75,7 @@ export function apply(ctx, config = {}) {
           const onProgress = releaseProgress.begin();
           try {
             const result = await dockerRuntime.start(body, { onProgress });
-            releaseProgress.finish(true); reply(200, result); return;
+            releaseProgress.finish(true, result); reply(200, result); return;
           } catch (error) { releaseProgress.finish(false); throw error; }
         }
         if (name === 'docker-status') {
@@ -86,12 +86,13 @@ export function apply(ctx, config = {}) {
           if (typeof dockerRuntime.overview !== 'function') throw new ApiError('当前发布入口尚不支持部署概览，请更新受控入口',409);
         }
         if (name === 'docker-restore' && typeof dockerRuntime.restore !== 'function') throw new ApiError('当前发布入口不支持恢复，请更新受控入口',409);
-        const method = {'docker-overview':'overview','docker-plan':'check','docker-promote':'promotion','docker-restore':'restore','docker-start':'start','docker-status':'status','docker-accept':'accept','docker-reconcile':'reconcile'}[name];
+        const method = {'docker-overview':'overview','docker-plan':'check','docker-promote':'promotion','docker-restore':'restore','docker-start':'start','docker-status':'status','docker-accept':'accept','docker-reconcile':'reconcile','docker-migration-report':'migrationReport','docker-migration-retry':'migrationRetry'}[name];
+        if (typeof dockerRuntime[method] !== 'function') throw new ApiError('当前发布入口不支持此操作，请更新受控入口',409);
         reply(200,await dockerRuntime[method](name === 'docker-status' ? body.jobId : body));return;
       }
       if (['remote-dev-check','remote-dev-start'].includes(name)) throw new ApiError('旧本地构建上传链路已停用：远程部署仅允许 GitHub 远程 dev 提交', 409);
       if (name === 'error-notify') throw new ApiError('报错自动发送功能已移除，请在面板查看错误详情', 410);
       reply(200, name === 'docker-preview' ? await dockerPreview(body) : name === 'remote-dev-check' ? await nativeDev.check(body) : name === 'remote-dev-start' ? await nativeDev.start(body) : name === 'remote-dev-status' ? await nativeDev.status(body) : name === 'remote-deploy-notify' ? await remoteDeploy.notify(body) : name === 'environment-inspect' ? await environment.inspect() : name === 'environment-notify' ? await environment.notify(body) : name === 'update-check' ? await updater.check() : name === 'update-install' ? await updater.install(body) : name === 'choose-directory' ? await chooseDirectory() : name === 'notify-conflict' ? await notifier.notify(body) : await service.route(name, body, url.searchParams));
-    } catch (error) { reply(error instanceof ApiError ? error.status : [400,403,404,409,429,503,504].includes(error.status) ? error.status : 400, { ok: false, error: error instanceof ApiError ? error.message : redact(error.message || 'Operation failed').slice(0, 1000) }); }
+    } catch (error) { reply(error instanceof ApiError ? error.status : [400,403,404,409,429,503,504].includes(error.status) ? error.status : 400, { ok: false, error: error instanceof ApiError ? error.message : redact(error.message || 'Operation failed').slice(0, 1000), ...(error.status === 409 && error.code === 'RELEASE_PREPARATION_RUNNING' ? { code: 'RELEASE_PREPARATION_RUNNING' } : {}) }); }
   } }));
 }

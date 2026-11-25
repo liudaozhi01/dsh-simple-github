@@ -11,6 +11,8 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$(?![\s\S])/;
 const SHA = /^[a-f0-9]{40}$(?![\s\S])/;
 const fail = (message, status = 400) => Object.assign(new Error(message), { status });
 const releaseRefusals = new Map([
+  ['State/config too large', '发布入口读取配置或状态文件超过容量限制，请管理员更新受控发布入口；请核对任务状态，不要重复提交发布。'],
+  ['Release state too large', '发布入口读取配置或状态文件超过容量限制，请管理员更新受控发布入口；请核对任务状态，不要重复提交发布。'],
   ['Preflight service failure: 预设超管初始化冲突：admin账号已绑定其他人员，请人工核对，不会自动换绑', '发布前检查失败：后端启动失败。预设超管初始化冲突：admin账号已绑定其他人员，请人工核对，不会自动换绑；本次发布尚未启动。'],
   ['Test database recovery failed; manual recovery required before retry', 'test 数据库自动恢复失败，环境仍处于维护中，禁止重试；须由管理员完成恢复和核对后才能重试。'],
   ['Dev release has no bound schema snapshot; publish dev first', '当前 dev 发布记录没有绑定数据库结构快照，请先重新发布 dev，再发布 test；本次未修改 test 数据库。'],
@@ -21,6 +23,8 @@ const releaseRefusals = new Map([
   ['Existing services must be healthy', '发布前检查失败：当前环境服务不健康，请先排查并恢复服务；本次发布尚未启动。'],
   ['Expected one existing container per service', '发布前检查失败：当前环境存在缺失或未运行的服务容器；本次发布尚未启动。'],
   ['Another release operation is active', '服务器已有发布操作正在执行，请先查询状态，不要重复发布。'],
+  ['Active worker blocks new deployment', '服务器仍有发布进程或待核验的启动任务，请先查询状态；本次新发布尚未启动。'],
+  ['Database recovery blocks new deployment', 'test 数据库维护或恢复尚未完成，请先由管理员核对恢复；本次新发布尚未启动。'],
   ['Unresolved job blocks new deployment', '当前环境有旧的未解决发布任务阻止新部署，请先查询任务状态并只读核对；本次发布尚未启动，不要重复发布。'],
 ]);
 function knownReleaseRefusal(text) {
@@ -34,7 +38,7 @@ function knownReleaseRefusal(text) {
   }
 }
 function refusalStatus(reason) {
-  return reason === releaseRefusals.get('Unresolved job blocks new deployment') ? 409 : 503;
+  return ['Unresolved job blocks new deployment', 'Active worker blocks new deployment', 'Database recovery blocks new deployment'].some(key => reason === releaseRefusals.get(key)) ? 409 : 503;
 }
 const releaseStageLabels = Object.freeze({
   'db-preflight': '数据库发布前检查', 'db-maintenance': '进入数据库维护',
@@ -46,22 +50,8 @@ const releaseStageLabels = Object.freeze({
   applying: '更新服务', health: '健康检查', 'awaiting-acceptance': '等待验收',
 });
 function unresolvedActivityMessage(job) {
-  // Failure diagnostics explain why the environment is blocked; activity metadata
-  // must not hide them. Keep the no-replay guard and never echo arbitrary logs.
-  if (job.status === 'uncertain') {
-    const text = [job.errorSummary, ...(Array.isArray(job.errorDetails) ? job.errorDetails : [])].filter(x => typeof x === 'string').join('\n').slice(0, 65536);
-    const admin = '预设超管初始化冲突：admin账号已绑定其他人员，请人工核对，不会自动换绑';
-    const foreignKey = text.match(/Referencing column '[A-Za-z0-9_]+' and referenced column '[A-Za-z0-9_]+' in foreign key constraint '[A-Za-z0-9_]+' are incompatible\./);
-    const reason = text.includes(admin) ? admin : foreignKey?.[0];
-    if (reason) return `上次发布失败，结果仍待核对。实际错误：${reason}。本次发布尚未启动；请先处理故障并核对旧任务，不要重复发布。`;
-  }
-  if (!Object.hasOwn(job, 'activity')) return '任务记录未完成，服务器尚未提供活动核验，请核对/升级';
-  const activity = job.activity;
-  if (!activity || ![Object.prototype, null].includes(Object.getPrototypeOf(activity)) ||
-    !['active', 'interrupted', 'unknown', 'finished'].includes(activity.state)) return '无法确认发布活动，暂不发布';
-  if (activity.state === 'interrupted') return '上次发布已中断，待核对';
-  // Activity is diagnostic only: even "finished" cannot resolve an unfinished job.
-  if (activity.state !== 'active') return '无法确认发布活动，暂不发布';
+  // Called only for positively verified live activity; historical errors remain
+  // visible in status, but are not a reason to block a different release.
   const actor = typeof job.actor === 'string'
     ? Array.from(job.actor.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '').trim()).slice(0, 80).join('') : '';
   const details = [];
@@ -144,7 +134,7 @@ export function createTemporaryReleaseTransport({ port, bridge: injectedBridge, 
   async function request({ profile: inputProfile, action, body, bundle, onProgress }) {
     ensure();
     const profile = validateReleaseProfile(inputProfile);
-    if (!['check', 'promote', 'start', 'status', 'overview', 'restore', 'accept', 'reconcile'].includes(action)) throw fail('无效发布操作');
+    if (!['check', 'promote', 'start', 'status', 'overview', 'restore', 'accept', 'reconcile', 'migration_report', 'migration_retry'].includes(action)) throw fail('无效发布操作');
     if (bundle) { if (action !== 'start') throw fail('仅开发启动允许源码包'); bundle = bundleInfo({ ...bundle, cleanup() {} }); }
     if (team) {
       const identity = await host(profile);
@@ -245,18 +235,16 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
   async function preflight(environment) {
     if (!team) return;
     const overview = await call('overview', {});
-    // Missing or ambiguous history must never be interpreted as an idle environment.
+    // Validate the response, but do not confuse historical status with live work.
+    // Missing/unknown activity is decided by the server's locked process check;
+    // this advisory read cannot establish that pending/running workers are idle.
     if (!Array.isArray(overview.jobs) || !overview.jobs.every(job => job &&
       [Object.prototype, null].includes(Object.getPrototypeOf(job)) &&
       typeof job.jobId === 'string' && ID.test(job.jobId) &&
       ['dev', 'test'].includes(job.environment) &&
       ['pending', 'running', 'uncertain', 'delivered', 'failed', 'ready', 'accepted'].includes(job.status))) throw fail('发布任务概览格式无效；未准备源码或启动发布，请先查询状态', 503);
-    const unresolved = overview.jobs.filter(job => job.environment === environment && ['pending', 'running', 'uncertain'].includes(job.status));
-    if (unresolved.length) {
-      // Prefer a positively verified active publisher over stale history in the same environment.
-      const job = unresolved.find(job => job.activity?.state === 'active') || unresolved[0];
-      throw fail(unresolvedActivityMessage(job), 409);
-    }
+    const active = overview.jobs.find(job => job.environment === environment && job.activity?.state === 'active');
+    if (active) throw fail(unresolvedActivityMessage(active), 409);
   }
   function remember(response, environment, expectedHead) {
     id(response.planId);
@@ -323,6 +311,16 @@ export function createTemporaryReleaseClient({ port, getUser, profile: inputProf
     async status(jobId) { if (jobId !== undefined) id(jobId); return call('status', jobId === undefined ? {} : { jobId }); },
     async accept(input = {}) { const body = object(input, ['jobId', 'confirmation']); id(body.jobId); if (body.confirmation !== true) throw fail('必须明确确认业务验收'); ensure(); await owner(['dev']); return call('accept', body); },
     async reconcile(input = {}) { const body = object(input, ['jobId']); id(body.jobId); return call('reconcile', body); },
+    async migrationReport(input = {}) {
+      const body = object(input, ['jobId', 'offset', 'limit']); id(body.jobId);
+      if (body.offset !== undefined && (!Number.isSafeInteger(body.offset) || body.offset < 0) || body.limit !== undefined && (!Number.isSafeInteger(body.limit) || body.limit < 1 || body.limit > 50)) throw fail('迁移清单分页无效');
+      await owner(['test']); return call('migration_report', body);
+    },
+    async migrationRetry(input = {}) {
+      const body = object(input, ['jobId', 'confirmation', 'corrections']); id(body.jobId);
+      if (body.confirmation !== true || !Array.isArray(body.corrections) || body.corrections.length > 100 || Buffer.byteLength(JSON.stringify(body)) > 12000) throw fail('补导须确认并提供有限条修正数据');
+      await owner(['test']); return call('migration_retry', body);
+    },
     close() { closed = true; plans.clear(); channel.close?.(); },
   });
 }

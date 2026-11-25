@@ -39,6 +39,23 @@ test('exact-name gate on starts, promotion, acceptance; readonly status still al
   await assert.rejects(f.client.promotion({ releaseId: 'x' }), { status: 403 }); await assert.rejects(f.client.accept({ jobId: 'x', confirmation: true }), { status: 403 });
   await f.client.status(); assert.equal(f.calls.length, 1);
 });
+test('migration report and retry require test owner, bounded corrections and never replay failures', async () => {
+  const f = fixture();
+  await f.client.migrationReport({jobId:'job-1', offset:0, limit:25});
+  await f.client.migrationRetry({jobId:'job-1', confirmation:true, corrections:[{rowId:'row-1', values:{removed:{$omit:true}}}]});
+  assert.deepEqual(f.calls.map(c=>c.action), ['migration_report','migration_retry']);
+  await assert.rejects(f.client.migrationRetry({jobId:'job-1', confirmation:false, corrections:[]}));
+  await assert.rejects(f.client.migrationRetry({jobId:'job-1', confirmation:true, corrections:Array(101).fill({})}));
+  await assert.rejects(f.client.migrationRetry({jobId:'job-1', confirmation:true, corrections:[{x:'x'.repeat(12000)}]}));
+  const denied=fixture('other');
+  await assert.rejects(denied.client.migrationReport({jobId:'job-1'}), {status:403});
+  await assert.rejects(denied.client.migrationRetry({jobId:'job-1',confirmation:true,corrections:[]}), {status:403});
+  assert.equal(denied.calls.length,0);
+  let attempts=0;
+  const lost=fixture('刘道志',{transport:async()=>{attempts++;throw Error('lost');}});
+  await assert.rejects(lost.client.migrationRetry({jobId:'job-1',confirmation:true,corrections:[]}));
+  assert.equal(attempts,1);
+});
 test('lost start response consumes plan, cleans source, never retries; close blocks further work', async () => {
   let starts = 0, cleaned = 0;
   const p = profile();
@@ -74,7 +91,7 @@ test('production rejects oversized script and wrong SSH identity without remote 
   await assert.rejects(wrong.request({ profile: profile(), action: 'status', body: {} }), /身份/);
 });
 test('known preflight refusals survive transport and client without leaking stderr', async () => {
-  for (const [reason, expected] of [['Existing services must be healthy', /服务不健康/], ['Expected one existing container per service', /缺失或未运行/], ["Preflight service failure: Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible.", /外键字段类型不兼容.*rbac_account_ibfk_1/]]) {
+  for (const [reason, expected] of [['State/config too large', /超过容量限制.*更新受控发布入口/], ['Release state too large', /超过容量限制.*更新受控发布入口/], ['Existing services must be healthy', /服务不健康/], ['Expected one existing container per service', /缺失或未运行/], ["Preflight service failure: Referencing column 'employee_id' and referenced column 'id' in foreign key constraint 'rbac_account_ibfk_1' are incompatible.", /外键字段类型不兼容.*rbac_account_ibfk_1/]]) {
     for (const jsonResponse of [false, true]) {
     const p = profile();
     const transport = createTemporaryReleaseTransport({ port: 1, script: 'pass', bridge: async path => {
@@ -95,6 +112,14 @@ test('schema structural refusal survives JSON transport and repeated sanitizatio
   await assert.rejects(f.client.check(),error=>/org_employee.id/.test(error.message)&&/test varchar\(36\) → dev bigint/.test(error.message)&&!error.message.includes('secret'));
   transport.close();
 });
+for (const [reason, expected] of [['Active worker blocks new deployment', /发布进程或待核验的启动任务/], ['Database recovery blocks new deployment', /数据库维护或恢复尚未完成/]]) {
+  test('server safety refusal is preserved without replay: ' + reason, async () => {
+    let calls=0;
+    const f=fixture('刘道志',{transport:async()=>{calls++;return {error:reason};}});
+    await assert.rejects(f.client.check(),error=>error.status===409&&expected.test(error.message));
+    assert.equal(calls,1);
+  });
+}
 test('unknown transport failures remain private and uncertain', async () => {
   const f = fixture('刘道志', { transport: async () => { throw Error('password=secret'); } });
   await assert.rejects(f.client.check(), error => /未明确响应/.test(error.message) && !error.message.includes('secret'));

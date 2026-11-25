@@ -52,8 +52,19 @@ def _type(value):
     match = re.fullmatch(r"varchar\(([1-9][0-9]*)\)", value)
     if match and int(match[1]) <= 16383:
         return ("varchar", int(match[1]))
+    if value in ('tinyblob', 'blob', 'mediumblob', 'longblob'):
+        return ('other', value)
+    match = re.fullmatch(r'(binary|varbinary)\(([1-9][0-9]*)\)', value)
+    if match and int(match[2]) <= (255 if match[1] == 'binary' else 65535):
+        return ('other', value)
+    match = re.fullmatch(r'decimal\(([1-9][0-9]?),([0-9]{1,2})\)', value)
+    if match and int(match[1]) <= 65 and int(match[2]) <= min(30, int(match[1])):
+        return ('other', value)
+    match = re.fullmatch(r'char\(([1-9][0-9]*)\)', value)
+    if match and int(match[1]) <= 255:
+        return ('other', value)
     # These ordinary types can remain unchanged or be added, never converted.
-    if re.fullmatch(r"(?:date|datetime(?:\([0-6]\))?|timestamp(?:\([0-6]\))?|time(?:\([0-6]\))?|text|mediumtext|longtext|json|decimal\([1-9][0-9]?,[0-9]+\)|char\([1-9][0-9]*\))", value):
+    if re.fullmatch(r"(?:date|datetime(?:\([0-6]\))?|timestamp(?:\([0-6]\))?|time(?:\([0-6]\))?|text|mediumtext|longtext|json)", value):
         return ("other", value)
     _fail("列类型不受支持，无法证明安全")
 
@@ -115,7 +126,7 @@ def _without_literals(sql):
     return re.sub(r"'(?:[^'\\]|'')*'|`(?:[^`]|``)*`", "?", sql)
 
 
-def _table(name, table):
+def _table(name, table, unchanged=False):
     _name(name)
     _keys(table, ("createSQL", "columns", "indexes", "foreignKeys", "options"))
     if type(table["columns"]) is not dict or not table["columns"]:
@@ -128,13 +139,18 @@ def _table(name, table):
         _fail("元数据必须为普通JSON值")
     for col, metadata in table["columns"].items():
         _name(col)
-        _column(metadata)
+        if unchanged and type(metadata) is dict and metadata.get("extra") in ("STORED GENERATED", "VIRTUAL GENERATED"):
+            ordinary = dict(metadata, extra="")
+            _column(ordinary)
+        else:
+            _column(metadata)
     sql = table["createSQL"]
     if not isinstance(sql, str) or "\\" in sql or "\x00" in sql:
         _fail("建表SQL格式不受支持")
     sql = sql.strip().removesuffix(";")
     masked = _without_literals(sql)
-    if any(token in masked for token in (";", "--", "/*", "#")) or re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|TRUNCATE|PARTITION|LIKE|TABLESPACE)\b", masked, re.I):
+    statement_mask = re.sub(r"\bON (?:DELETE|UPDATE) (?:RESTRICT|CASCADE|SET NULL|NO ACTION)\b", "", masked, flags=re.I)
+    if any(token in masked for token in (";", "--", "/*", "#")) or re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|DROP|TRUNCATE|PARTITION|LIKE|TABLESPACE)\b", statement_mask, re.I):
         _fail("建表SQL含不支持或非结构语句")
     lines = sql.splitlines()
     if len(lines) < 3 or lines[0] != "CREATE TABLE " + _name(name) + " (" or not lines[-1].startswith(") ENGINE=InnoDB "):
@@ -149,6 +165,12 @@ def _table(name, table):
             col, definition = match.groups()
             if col in definitions or col not in table["columns"]:
                 _fail("建表SQL与列元数据不一致")
+            # Unchanged generated definitions are never emitted as executable SQL.
+            if unchanged and table["columns"][col]["extra"] in ("STORED GENERATED", "VIRTUAL GENERATED"):
+                if " GENERATED ALWAYS AS " not in definition.upper():
+                    _fail("生成列定义与元数据不一致")
+                definitions[col] = definition
+                continue
             # SHOW CREATE may omit explicit NULL and emit unquoted numeric defaults.
             expected = _column(table["columns"][col])
             def normalized(value):
@@ -162,10 +184,13 @@ def _table(name, table):
                     inherited = re.search(r"\b" + token + r"=([A-Za-z0-9_]+)", lines[-1])
                     if inherited:
                         value = re.sub(r" " + keyword + r" " + re.escape(inherited[1]) + r"\b", "", value, flags=re.I)
-                value = re.sub(r"(?<!NOT) NULL(?= DEFAULT| COMMENT|$)", "", value, flags=re.I)
+                value = re.sub(r"(?<!NOT)(?<!DEFAULT) NULL(?= DEFAULT| COMMENT|$)", "", value, flags=re.I)
+                metadata = table["columns"][col]
+                if metadata["nullable"] and metadata.get("default") is None and metadata["type"].lower() in ("tinyblob", "blob", "mediumblob", "longblob", "text", "mediumtext", "longtext", "json"):
+                    value = re.sub(r" DEFAULT NULL(?= COMMENT|$)", "", value, flags=re.I)
                 value = value.lower()
                 value = re.sub(r"\x01([0-9]+)\x02", lambda m: literals[int(m[1])], value)
-                return re.sub(r"default (-?[0-9]+)(?= |$)", r"default '\1'", value)
+                return re.sub(r"default (-?[0-9]+(?:\.[0-9]+)?)(?= |$)", r"default '\1'", value)
             if normalized(expected) != normalized(definition):
                 _fail("建表SQL与列元数据不一致或列语法不受支持")
             definitions[col] = definition
@@ -176,6 +201,21 @@ def _table(name, table):
     if set(definitions) != set(table["columns"]):
         _fail("列顺序或列元数据不完整")
     return definitions, rest, lines[-1]
+
+
+def _unchanged_table(name, source, target):
+    if source == target:
+        return True
+    if type(source) is not dict or type(target) is not dict:
+        return False
+    if {k: v for k, v in source.items() if k != 'createSQL'} != {k: v for k, v in target.items() if k != 'createSQL'}:
+        return False
+    # Ordinary definitions are independently validated against identical metadata.
+    # Generated expressions, column order and constraints must still match exactly.
+    a, b = _table(name, source, True), _table(name, target, True)
+    return (list(a[0]) == list(b[0]) and a[1:] == b[1:] and all(
+        a[0][col] == b[0][col] for col, metadata in source['columns'].items()
+        if metadata['extra'] in ('STORED GENERATED', 'VIRTUAL GENERATED')))
 
 
 # Diagnostics are a separate, read-only projection, never a planner input or SQL.
@@ -270,12 +310,15 @@ def review_details(source, target) -> list:
                 metadata = cols[column]
                 if type(metadata) is not dict:
                     add("UNSUPPORTED_METADATA", name, column)
-                elif _review_type(metadata.get("type")) is None:
-                    add("UNSUPPORTED_TYPE", name, column)
+                else:
+                    try:
+                        _type(metadata.get("type"))
+                    except ValueError:
+                        add("UNSUPPORTED_TYPE", name, column)
             # Reuse the planner's complete metadata/SQL validation, but never its
             # exception text. Invalid identifiers are represented only by fallback.
             try:
-                _table(name, table)
+                _table(name, table, name in src and name in dst and _unchanged_table(name, src[name], dst[name]))
             except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
                 add("UNSUPPORTED_METADATA", name)
         if name not in src or name not in dst:
@@ -313,6 +356,76 @@ def review_details(source, target) -> list:
     return result
 
 
+def _new_table_dependencies(name, table, source, parsed):
+    """Validate complete FK metadata against SHOW CREATE before ordering new tables."""
+    groups = {}
+    for fk in table["foreignKeys"]:
+        _keys(fk, ("name", "position", "column", "table", "target", "update", "delete", "match"))
+        for key in ("name", "column", "table", "target"):
+            _name(fk[key])
+        if type(fk["position"]) is not int or fk["position"] < 1 or fk["match"] != "NONE":
+            _fail("新增表外键元数据不受支持")
+        if any(fk[k] not in ("NO ACTION", "RESTRICT", "CASCADE", "SET NULL") for k in ("update", "delete")):
+            _fail("新增表外键动作不受支持")
+        groups.setdefault(fk["name"], []).append(fk)
+    expected, dependencies = [], set()
+    for constraint, entries in sorted(groups.items()):
+        entries = sorted(entries, key=lambda x: x["position"])
+        first = entries[0]
+        if [x["position"] for x in entries] != list(range(1, len(entries) + 1)) or any(
+                any(x[k] != first[k] for k in ("table", "update", "delete")) for x in entries):
+            _fail("新增表复合外键元数据不一致")
+        parent = source.get(first["table"])
+        if parent is None:
+            _fail("新增表外键引用表缺失")
+        for entry in entries:
+            child_col = table["columns"].get(entry["column"])
+            parent_col = parent["columns"].get(entry["target"])
+            if child_col is None or parent_col is None or any(child_col[k] != parent_col[k] for k in ("type", "charset", "collation")):
+                _fail("新增表外键列不兼容")
+            if "SET NULL" in (first["update"], first["delete"]) and not child_col["nullable"]:
+                _fail("新增表外键置空与非空列冲突")
+        child = ",".join(_name(x["column"]) for x in entries)
+        parent_cols = ",".join(_name(x["target"]) for x in entries)
+        line = "CONSTRAINT " + _name(constraint) + " FOREIGN KEY (" + child + ") REFERENCES " + _name(first["table"]) + " (" + parent_cols + ")"
+        # MySQL omits the default NO ACTION but retains explicit RESTRICT.
+        for key in ("delete", "update"):
+            if first[key] != "NO ACTION":
+                line += " ON " + key.upper() + " " + first[key]
+        expected.append(line)
+        if first["table"] != name:
+            dependencies.add(first["table"])
+    actual = [line for line in parsed[1] if "FOREIGN KEY" in _without_literals(line).upper()]
+    normalize = lambda line: re.sub(r"\s*,\s*", ",", line)
+    if sorted(map(normalize, actual)) != sorted(map(normalize, expected)):
+        _fail("新增表外键SQL与元数据不一致")
+    return dependencies
+
+
+def _column_dependencies(name, column, tables, parsed):
+    """Fail closed for incomplete/expression metadata and any affected constraint."""
+    table = tables[name]
+    for index in table["indexes"]:
+        if type(index) is not dict or not isinstance(index.get("column"), str) or index.get("expression", "unknown") is not None or index["column"] == column:
+            return True
+    for line in parsed[1]:
+        if "FOREIGN KEY" in _without_literals(line).upper():
+            continue
+        if not re.match(r"(?:PRIMARY KEY |UNIQUE KEY |KEY )", line):
+            return True
+        # Ignore the index name but not indexed column identifiers.
+        body = line[line.index("("):] if "(" in line else line
+        if _name(column) in body:
+            return True
+    for owner, candidate in tables.items():
+        for fk in candidate["foreignKeys"]:
+            if type(fk) is not dict or not all(isinstance(fk.get(k), str) for k in ("column", "table", "target")):
+                return True
+            if (owner == name and fk["column"] == column) or (fk["table"] == name and fk["target"] == column):
+                return True
+    return False
+
+
 def plan_schema(source, target):
     """Return deterministic DDL only; fail atomically without returning partial SQL."""
     _keys(source, ("tables",))
@@ -321,17 +434,15 @@ def plan_schema(source, target):
         if type(snapshot["tables"]) is not dict:
             _fail("表元数据必须为对象")
     src, dst = source["tables"], target["tables"]
-    parsed_source = {name: _table(name, table) for name, table in src.items()}
-    parsed_target = {name: _table(name, table) for name, table in dst.items()}
+    unchanged = {name for name in src.keys() & dst.keys() if _unchanged_table(name, src[name], dst[name])}
+    parsed_source = {name: _table(name, table, name in unchanged) for name, table in src.items()}
+    parsed_target = {name: _table(name, table, name in unchanged) for name, table in dst.items()}
     if set(dst) - set(src):
         _fail("禁止删除表")
     result = []
     for name in sorted(src):
         desired = src[name]
-        if name not in dst:
-            if desired["foreignKeys"] or any("FOREIGN KEY" in x.upper() for x in parsed_source[name][1]):
-                _fail("新增表外键依赖不支持自动排序")
-            result.append(desired["createSQL"].strip().removesuffix(";") + ";")
+        if name not in dst or name in unchanged:
             continue
         current = dst[name]
         for key, reason in (("indexes", "索引差异禁止自动同步"), ("foreignKeys", "外键差异禁止自动同步"), ("options", "表选项差异不受支持")):
@@ -358,10 +469,10 @@ def plan_schema(source, target):
             # MySQL SHOW CREATE may materialize inherited CHARACTER SET after ALTER.
             elif column != tc[col]:
                 old = tc[col]
-                if column["extra"] or old["extra"] or desired["foreignKeys"] or desired["indexes"] or srest:
+                if column["extra"] or old["extra"] or _column_dependencies(name, col, src, parsed_source[name]) or _column_dependencies(name, col, dst, parsed_target[name]):
                     _fail("带索引外键或扩展属性的列不支持自动修改")
                 # Changing integer to text necessarily introduces charset metadata.
-                ignore = {"type"}
+                ignore = {"type", "comment"}
                 if _type(old["type"])[0] == "int" and _type(column["type"])[0] == "varchar":
                     ignore |= {"charset", "collation"}
                 if any(column.get(k) != old.get(k) or (k in column) != (k in old) for k in set(column) | set(old) if k not in ignore) or not _safe_type(old["type"], column["type"]):
@@ -370,4 +481,16 @@ def plan_schema(source, target):
                     _fail("列SQL存在未解释差异")
                 result.append("ALTER TABLE " + _name(name) + " MODIFY COLUMN " + _name(col) + " " + sdefs[col] + ";")
             previous = col
+    # Existing-table alterations run first, so referenced added columns exist.
+    pending = {name: _new_table_dependencies(name, src[name], src, parsed_source[name])
+               for name in sorted(src.keys() - dst.keys())}
+    available = set(dst)
+    while pending:
+        ready = sorted(name for name, deps in pending.items() if deps <= available)
+        if not ready:
+            _fail("新增表存在循环外键依赖，需人工迁移")
+        for name in ready:
+            result.append(src[name]["createSQL"].strip().removesuffix(";") + ";")
+            available.add(name)
+            del pending[name]
     return result

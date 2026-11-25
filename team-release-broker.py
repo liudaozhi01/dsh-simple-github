@@ -31,6 +31,9 @@ SOCKET = '/run/xian-oa-team-release.sock'
 MAX_REQUEST = 16384
 MAX_RESPONSE = 65536
 MAX_BUNDLE = 256 * 1024 * 1024
+MAX_CONFIG = 1024 * 1024
+# Trusted plans/jobs embed full database schema snapshots; not network input.
+MAX_STATE = 16 * 1024 * 1024
 IO_TIMEOUT = 10
 COMMAND_TIMEOUT = 600
 MAX_CLIENTS = 4
@@ -43,6 +46,8 @@ ACTIONS = {
     'status': ({'jobId'}, set()),
     'accept': ({'jobId', 'confirmation'}, {'jobId', 'confirmation'}),
     'reconcile': ({'jobId'}, {'jobId'}),
+    'migration_report': ({'jobId', 'offset', 'limit'}, {'jobId'}),
+    'migration_retry': ({'jobId', 'confirmation', 'corrections'}, {'jobId', 'confirmation', 'corrections'}),
 }
 
 class Refused(Exception):
@@ -90,13 +95,13 @@ def configure_runtime():
     SOCKET = '/run/dsh-release-' + PROJECT_ID + '.sock'
 
 
-def read_json(path):
+def read_json(path, *, limit=MAX_CONFIG, too_large='State/config too large'):
     private(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     with os.fdopen(fd, 'rb') as f:
-        require(os.fstat(f.fileno()).st_size <= 1024 * 1024, 'State/config too large')
-        data = f.read(1024 * 1024 + 1)
-    require(len(data) <= 1024 * 1024, 'State/config too large')
+        require(os.fstat(f.fileno()).st_size <= limit, too_large)
+        data = f.read(limit + 1)
+    require(len(data) <= limit, too_large)
     return loads(data)
 
 def load_config():
@@ -177,7 +182,8 @@ class Broker:
     def record(self, kind, key):
         private(self.state, True)
         require(stat.S_IMODE(self.state.stat().st_mode) == 0o700, 'Private state required')
-        return read_json(self.state / (kind + '-' + identifier(key) + '.json'))
+        return read_json(self.state / (kind + '-' + identifier(key) + '.json'),
+                         limit=MAX_STATE, too_large='Release state too large')
 
     def environment(self, request, user):
         action, body = request['action'], request['body']
@@ -208,7 +214,7 @@ class Broker:
                 private(self.state, True)
                 for n, path in enumerate(self.state.glob('job-*.json')):
                     require(n < 4096, 'Too many jobs; query explicit jobId')
-                    job = read_json(path)
+                    job = read_json(path, limit=MAX_STATE, too_large='Release state too large')
                     if job.get('actor') == user:
                         jobs.append(job)
             if not jobs:

@@ -50,6 +50,8 @@ def validate_request(data):
         'overview': (set(), set()), 'status': ({'jobId'}, set()),
         'accept': ({'jobId', 'confirmation'}, {'jobId', 'confirmation'}),
         'reconcile': ({'jobId'}, {'jobId'}),
+        'migration_report': ({'jobId', 'offset', 'limit'}, {'jobId'}),
+        'migration_retry': ({'jobId', 'confirmation', 'corrections'}, {'jobId', 'confirmation', 'corrections'}),
     }
     if type(request) is not dict or set(request) != {'action', 'body'} or type(request['action']) is not str or request['action'] not in actions or type(request['body']) is not dict:
         raise ValueError('Invalid action/body')
